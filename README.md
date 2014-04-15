@@ -27,11 +27,8 @@ print_stuffies true
 \#END METHOD INPUT
 
 \#ATOMS START
-
 F 0 0 0
-
 H 0 0 0.9
-
 \#ATOMS END
 
 If you want to change basis set you can use for example 4-31G, STO-3G, 6-311-2d2p or 6-311ss. Not all atoms implemented for all these basis sets jet, but soon.
