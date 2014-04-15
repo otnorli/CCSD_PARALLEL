@@ -1,3 +1,5 @@
+RHF CCSD USING CLOSED SHELL GAUSSIAN TYPE ORBITALS FROM EMSL BASIS SET EXCHANGE
+
 Big CCSD program. Very fast! Implemented brand new optimizations never before seen in the human world. 
 
 Should be noted that it currently only works for even number of electrons, but we only need to add a few +1 and -1 around the code for it to work for odd number of electrons, no optimizations exclude odd number of electrons.
