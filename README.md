@@ -13,9 +13,11 @@ Program uses Armadillo and MPI. No OpenMP or any of that. Please supply blas and
 \#ATOMS BEGIN
 
 then list a bunch of atoms, like 
+
 O 0 0 0
+
 H 1 0 0
-etc
+ etc
 
 and then \#ATOMS END
 
