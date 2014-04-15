@@ -11,17 +11,27 @@ Program not 100% complete, still in the works. Simple minded version of CCSDTQ s
 Program uses Armadillo and MPI. No OpenMP or any of that. Please supply blas and lapack also. Input is given in a file you name "INCAR". In this file you write:
 
 \#BEGIN METHOD INPUT
+
 Basis_Set 6-311-2d2p
+
 Method CCSD
+
 convergance_criteria -8.0
+
 Relax_Pos false
+
 use_angstrom true
+
 print_stuffies true
+
 \#END METHOD INPUT
 
 \#ATOMS START
+
 F 0 0 0
+
 H 0 0 0.9
+
 \#ATOMS END
 
 If you want to change basis set you can use for example 4-31G, STO-3G, 6-311-2d2p or 6-311ss. Not all atoms implemented for all these basis sets jet, but soon.
