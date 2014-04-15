@@ -54,13 +54,13 @@ public:
     mat ReturnPotenser();
     vec ReturnNumberOfOrbitals();
     vector<cube> ReturnQ();
-    vec Return_Indexed_Q();
+    //vec Return_Indexed_Q();
     mat return_eigval_F();
     mat returnC();
     mat Energy_Fock_Matrix;
 
     int Get_Integral_Index(int a, int b, int i, int j);
-    vec Stored_Indexed_Q;
+    //vec Stored_Indexed_Q;
 
     void Normalize_small_c();
 

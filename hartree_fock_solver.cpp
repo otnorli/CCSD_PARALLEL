@@ -145,10 +145,11 @@ vector<cube> Hartree_Fock_Solver::ReturnQ()
     return return_Q;
 }
 
-vec Hartree_Fock_Solver::Return_Indexed_Q()
-{
-    return Stored_Indexed_Q;
-}
+//vec Hartree_Fock_Solver::Return_Indexed_Q()
+//{
+    //return Stored_Indexed_Q;
+//    return 0;
+//}
 
 mat Hartree_Fock_Solver::return_eigval_F()
 {
@@ -548,7 +549,7 @@ double Hartree_Fock_Solver::get_Energy(double toler)
     n_Basis = Fyll.Fyll_Opp_Nr_Basis_Functions();
     Number_Of_Orbitals = Fyll.Fyll_Opp_Antall_Orbitaler();
     Potenser = Fyll.Fyll_Opp_Potenser();
-    Stored_Indexed_Q = zeros(Get_Integral_Index(Matrix_Size-1, Matrix_Size-1, Matrix_Size-1, Matrix_Size-1) + 1); // Compact storage
+    //Stored_Indexed_Q = zeros(Get_Integral_Index(Matrix_Size-1, Matrix_Size-1, Matrix_Size-1, Matrix_Size-1) + 1); // Compact storage
 
 
     // For parallel implementation we do this:
@@ -690,7 +691,7 @@ double Hartree_Fock_Solver::get_Energy(double toler)
                              //* The flip is done to ensure we can use the stored E(...) in the same order as prior, such that E_counter is correct
 
 
-                            Stored_Indexed_Q(Get_Integral_Index(orb1, orb2, orb3, orb4)) = temp; // <-- PHYSICS NOTATION
+                            //Stored_Indexed_Q(Get_Integral_Index(orb1, orb2, orb3, orb4)) = temp; // <-- PHYSICS NOTATION
                         //}
 
 
@@ -884,7 +885,7 @@ void Hartree_Fock_Solver::Initialize_DIIS()
 void Hartree_Fock_Solver::Delete_Everything()
 {
     // Clear everything, this is kinda crazeh
-    Stored_Indexed_Q.clear();
+    //Stored_Indexed_Q.clear();
     Stored_Error.clear();
     Stored_F.clear();
     EK.clear();

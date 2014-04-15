@@ -60,7 +60,7 @@ double CCSD_Memory_optimized::CCSD(double toler, bool print_stuff)
 
     // Transform to MO basis, only initialize the MOs we need
     c = HartFock->ReturnC();
-    Integrals = HartFock->Return_Indexed_Q();
+    //Integrals = HartFock->Return_Indexed_Q();
     Prepear_AOs();
     fs = Fill_FS(HartFock->return_eigval_F());
     HartFock = NULL; // Remove this memory,  not needed anymore
@@ -2969,7 +2969,7 @@ void CCSD_Memory_optimized::Prepear_AOs()
     compact_mo = zeros(1,1,1); // Remove this memory, .clear didnt work, needs more armadillo knowledge :-O
     compact_mo2 = zeros(1,1,1); // Remove this memory, .clear didnt work, just put it to 1x1x1 for now :-O
 
-    Integrals.clear();
+    //Integrals.clear();
     c.clear();
 }
 

@@ -73,7 +73,7 @@ public:
     void Prepear_AOs();
     long Return_Integral_Index(int a, int b, int i, int j);
     mat c;
-    vec Integrals;
+    //vec Integrals;
     mat Fill_FS(vec eigval);
 
     mat integ2_2D, integ3_2D, integ4_2D, integ5_2D, integ6_2D, integ7_2D, integ8_2D, integ9_2D, integ10_2D;
