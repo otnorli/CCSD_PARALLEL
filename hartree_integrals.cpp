@@ -1,16 +1,21 @@
 #include "hartree_integrals.h"
 
-Hartree_Integrals::Hartree_Integrals(int n_N, vec n_B, mat pos, vec zZz, mat alp, int n_tot_bf, mat cc, vec n_O, mat pot, int n_E)
+Hartree_Integrals::Hartree_Integrals()
 {
-    R = pos;
-    n_Nuclei = n_N;
-    n_Basis = n_B;
-    Z = zZz;
-    Matrix_Size = n_tot_bf;
+
+}
+
+void Hartree_Integrals::Set_Input(mat alp, int n_tot_bf, mat cc, vec n_O, mat pot, vec n_B, int n_N, mat pos, vec zZz, int n_E)
+{
     alpha = alp;
+    Potenser = pot;
+    Matrix_Size = n_tot_bf;
     c = cc;
     n_Orbitals = n_O;
-    Potenser = pot;
+    n_Basis = n_B;
+    R = pos;
+    n_Nuclei = n_N;
+    Z = zZz;
     n_Electrons = n_E;
 }
 
@@ -140,11 +145,11 @@ void Hartree_Integrals::Fill_E_ij()
                 {
                     index_counter2 += 1;
 
-                    if (index_counter1 <= index_counter2)
+                    //if (index_counter1 <= index_counter2)
                         // Not gonna need all, because of symetri.
                         // This if test make sure we only calculate half the matrix + the diagonal
                         // Which is all we will need
-                    {
+                    //{
 
                     E_index(index_counter1, index_counter2) = E_counter;
 
@@ -203,7 +208,7 @@ void Hartree_Integrals::Fill_E_ij()
                             }
                         }
                     }
-                    }
+                    //}
                 }
             }
         }
@@ -247,6 +252,7 @@ void Hartree_Integrals::Set_Boys_Start(int N)
 {
     Boys_N = N;
 
+    // Double factorial
     Boys_Start = 1;
     double i = 1;
 
@@ -255,9 +261,17 @@ void Hartree_Integrals::Set_Boys_Start(int N)
         Boys_Start *= i;
     }
 
-    Boys_Start *= sqrt(acos(-1.0))/pow(2,N+1);
+    //Boys_Start *= sqrt(M_PI)/pow(2,N+1);
+}
 
-
+int Hartree_Integrals::Factorial(int N)
+{
+    int value=1;
+    for (int i = 2; i < (N+1); i++)
+    {
+        value *= i;
+    }
+    return value;
 }
 
 mat Hartree_Integrals::Overlap_Matrix()
@@ -602,13 +616,15 @@ double Hartree_Integrals::Nuclei_Electron_Interaction_Single_1d(double p, int t,
 double Hartree_Integrals::Boys(double x, double n)
 {
    double F;
-   int N = Boys_N;
+   int N = (n+2)*15;//Boys_N;
    F_Boys = zeros(N+1);
    double exp_term = exp(-x);
 
    if (x > 50)
    {
-       F = Boys_Start / pow(x, N+0.5);
+       Set_Boys_Start(N);
+
+       F = Boys_Start / pow(2.0, N+1) * sqrt(M_PI/pow(x, 2*N+1));
    }
 
    else
@@ -629,6 +645,7 @@ double Hartree_Integrals::Boys(double x, double n)
        }
        F *= exp_term;
    }
+
    F_Boys(N) = F;
    for (int i = N; i > n; i--)
    {
@@ -719,7 +736,6 @@ double Hartree_Integrals::Electron_Electron_Interaction_Single(int ind1, int ind
                                     * E_ij.at(E_counter2)(A2, D2, t2)
                                     * E_ij.at(E_counter2+1)(B2, E2, u2)
                                     * E_ij.at(E_counter2+2)(C2, F2, v2);
-
                         }
                     }
                 }

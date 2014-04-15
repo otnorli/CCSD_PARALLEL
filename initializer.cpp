@@ -1,6 +1,6 @@
 #include "initializer.h"
 
-Initializer::Initializer(int n_N, int n_E, string B_S, string met, bool r_pos, mat rr, vec zz, double con_crit, string r_uns)
+Initializer::Initializer(int n_N, int n_E, string B_S, string met, bool r_pos, mat rr, vec zz, double con_crit, int ran, int siz, bool us_ang)
 {
     Basis_Set = B_S;
     n_Nuclei = n_N;
@@ -10,9 +10,12 @@ Initializer::Initializer(int n_N, int n_E, string B_S, string met, bool r_pos, m
     R = rr;
     Z = zz;
     convergance_criteria = con_crit;
+    rank = ran;
+    size = siz;
+    use_angstrom = us_ang;
 }
 
-double Initializer::Go()
+double Initializer::Go(bool printie)
 {
     double Energy;
     int temp = 0;
@@ -22,6 +25,11 @@ double Initializer::Go()
         {
             temp += 1;
         }
+    }
+
+    if (rank != 0)
+    {
+        printie = false;
     }
 
     n_Nuclei = temp;
@@ -38,56 +46,63 @@ double Initializer::Go()
         n_Electrons += Z(i);
     }
 
+    if (use_angstrom == true)
+    {
+        R = R * 1.889725989;
+    }
 
-    cout << "Method used: " << Method << endl;
+    if (printie==true)
+    {
+        cout << "Method used: " << Method << endl;
+    }
+
     if (Relax_Pos)
     {
-        cout << "Relaxation activated" << endl;
-    }
-    else
-    {
-        cout << "Relaxation not activated" << endl;
+        if (printie == true)
+        {
+            cout << "Relaxation activated" << endl;
+        }
     }
 
-    cout << "Basis set used: " << Basis_Set << endl;
-    cout << "Number of electrons: " << n_Electrons << endl;
-    cout << "R = " << endl << R << endl << "Z = " << endl << Z << endl;
-    cout << "Starting calculations..." << endl;
+    else
+    {
+        if (printie == true)
+        {
+            cout << "Relaxation not activated" << endl;
+        }
+    }
+
+    if (printie == true)
+    {
+        cout << "Basis set used: " << Basis_Set << endl;
+        cout << "Number of electrons: " << n_Electrons << endl;
+        cout << "R = " << endl << R << endl << "Z = " << endl << Z << endl;
+        cout << "Starting calculations..." << endl;
+    }
 
     // Lets go
 
-        if (Relax_Pos)
-        {
-            if (Method == "HF")
-            {
-                Relax_The_Structure RTS(n_Nuclei, n_Electrons, R, Basis_Set, Z, Method);
-                R = RTS.Relaxation_HF(convergance_criteria);
-                cout << "After relaxation, new R = " << endl << R << endl;
-            }
-
-            if (Method == "CCSD")
-            {
-                Relax_The_Structure RTS(n_Nuclei, n_Electrons, R, Basis_Set, Z, Method);
-                R = RTS.Relaxation_CCSD(convergance_criteria);
-                cout << "After relaxation, new R = " << endl << R << endl;
-            }
-        }
-
+    Hartree_Fock_Solver HartFock(n_Nuclei, Z, R, Basis_Set, n_Electrons, printie, rank, size);
         if (Method == "HF")
         {
             // Kaller på Hartree Fock
-            Hartree_Fock_Solver HartFock(n_Nuclei, Z, R, Basis_Set, n_Electrons, true);
+
             Energy = HartFock.get_Energy(convergance_criteria);
-            cout << "Energy = " << Energy << " med " << convergance_criteria << " som convergens kriterie i Hartree Fock Metoden" << endl;
+            if (printie == true)
+            {
+                cout << "Energy = " << Energy << " med " << convergance_criteria << " som convergens kriterie i Hartree Fock Metoden" << endl;
+            }
         }
 
         if (Method == "CCSD")
         {
             // Kaller på Coupled Cluster, CCSD
-            //ccsd_v2_optimized CC(n_Nuclei, Z, R, Basis_Set, n_Electrons);
-            CCSD_Memory_optimized CC(n_Nuclei, Z, R, Basis_Set, n_Electrons);
-            Energy = CC.CCSD(convergance_criteria, true);
-            cout << "Energy = " << Energy << " med CCSD metoden" << endl;
+            CCSD_Memory_optimized CC(n_Nuclei, Z, R, Basis_Set, n_Electrons, rank, size, &HartFock);
+            Energy = CC.CCSD(convergance_criteria, printie);
+            if (printie == true)
+            {
+                cout << "Energy = " << Energy << " med CCSD metoden" << endl;
+            }
         }
 
         return Energy;

@@ -77,6 +77,15 @@ int matrix_size_setter::Set_Matrix_Size()
                     max_bas_func = 6;
                 }
             }
+
+            if (Z(i) == 16)
+            {
+                value += 27;
+                if (max_bas_func < 6)
+                {
+                    max_bas_func = 6;
+                }
+            }
         }
 
         if (System_String == "cc-pVDZ")
@@ -130,6 +139,16 @@ int matrix_size_setter::Set_Matrix_Size()
                 }
             }
 
+            if (Z(i) == 6)
+            {
+                value += 5;
+                if (max_bas_func < 3)
+                {
+                    max_bas_func = 3;
+                }
+            }
+
+
             if (Z(i) == 7)
             {
                 value += 5;
@@ -150,7 +169,7 @@ int matrix_size_setter::Set_Matrix_Size()
 
             if (Z(i) == 16)
             {
-                9;
+                value += 19;
                 if (max_bas_func < 3)
                 {
                     max_bas_func = 3;

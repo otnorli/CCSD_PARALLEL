@@ -7,6 +7,7 @@
 #include "matrix_size_setter.h"
 #include "fill_alpha.h"
 #include "hartree_integrals.h"
+#include "mpi.h"
 
 using namespace std;
 using namespace arma;
@@ -15,12 +16,21 @@ class Hartree_Fock_Solver
 {
 public:
     // Input parametre
-    Hartree_Fock_Solver(int n_N, vec zz, mat rr, string B_s, int n_elec, bool pstf);
+    Hartree_Fock_Solver(int n_N, vec zz, mat rr, string B_s, int n_elec, bool pstf, int ran, int siz);
     int n_Nuclei, steppp;
     vec Z;
     mat R;
     string Basis_Set;
     bool print_stuff;
+
+    // MPI
+    int rank, size;
+    double** Fock_MPI;
+    void Map_MPI();
+    vec WORK_PER_NODE;
+    double Calc_Integrals_On_The_Fly(int orb1, int orb3, int orb2, int orb4);
+    int Calc_Which_Atom_We_Are_Dealing_With(int orb1);
+    mat E_index;
 
     // Globale parametre
     vec n_Basis;
@@ -33,6 +43,10 @@ public:
     vec eigenvalues_O, eigenvalues_F;
     mat Potenser;
     vector<cube> return_Q;
+    field<mat> field_Q;
+    Hartree_Integrals HartInt;
+
+    mat Return_Field_Q(int i, int j);
 
     mat ReturnC();
     mat ReturnAlpha();
@@ -43,6 +57,7 @@ public:
     vec Return_Indexed_Q();
     mat return_eigval_F();
     mat returnC();
+    mat Energy_Fock_Matrix;
 
     int Get_Integral_Index(int a, int b, int i, int j);
     vec Stored_Indexed_Q;

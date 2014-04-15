@@ -1,30 +1,40 @@
 #include "ccsd_memory_optimized.h"
 
-CCSD_Memory_optimized::CCSD_Memory_optimized(int n_N, vec zz, mat rr, string B_s, int n_Elec)
+CCSD_Memory_optimized::CCSD_Memory_optimized(int n_N, vec zz, mat rr, string B_s, int n_Elec, int ran, int siz, Hartree_Fock_Solver *Hartfock)
 {
     n_Nuclei = n_N;
     Z = zz;
     R = rr;
     Basis_Set = B_s;
     n_Electrons = n_Elec;
+    rank = ran;
+    size = siz;
+    HartFock = Hartfock;
 }
 
 double CCSD_Memory_optimized::CCSD(double toler, bool print_stuff)
 {
     /*
      *
-     * *Optimeringstanker:
-     * - W3 er symmetrisk på en måte som er inni if testene i kommentar i koden. Finn ut hvordan skippe beregningene du ikke trenger
-     * - W4 symmetrisk?
-     * - W3(0,1) er 0 i øvre halvdel, trenger ikke lagres
-     * - W4(0,1) er 0 i nedre halvdel, trenger ikke lagres
      *
-     *  - Sjekk om ALLE kalkulasjoner = 0 for bestemte indekser... :O og fjern dette minnet
+     * *Optimization thoughts for programmer:
      *
-     *  - integ4, integ6 kan lagres for i > j, [integ(i,j)]
-     *  - integ10 kan lagres for (a+i)%2=0... ? :O
      *
-     * - W1 = integ8 ikke innefor for loopen
+     *
+     *          W_4 and W_2 is called depending upon a and b, meaning we can utilize this and only calculate the a and b that we need for each node
+     *          in the already parallel t2_new calculation. May cause some aditional calculations, but it is possible
+     *          This would also reduce memory needs significantly for what is now our largest array by far
+     *          Could also map W_4 out afterwards, since Part1_MPI stores this
+     *          Alternatively combine t2_MPI with Part1_MPI and save memory
+     *
+     *          First solution saves more memeory but more calculation expencive
+     *
+     *          W4(0,1) er 0 i nedre halvdel, trenger ikke lagres
+     *
+     *          Division by 2 uneccasary, but OPENMP might be used if we include it :O combine OPENMP and MPI
+     *          Can replace i/2 with I++ and I etc as done in meny functions
+     *
+     *
      *
      * */
 
@@ -35,99 +45,119 @@ double CCSD_Memory_optimized::CCSD(double toler, bool print_stuff)
     iter = 1;
     E_old = 0;
     E_new = 0;
-    int B=0,J; // dummie variables
 
     // Initializion
     double E_HF;
-    Hartree_Fock_Solver HartFock(n_Nuclei, Z, R, Basis_Set, n_Electrons, true);
-    E_HF = HartFock.get_Energy(toler); // Calc hartree fock energy
-    Matrix_Size = 2*HartFock.ReturnMatrixSize(); // This will be twice as big as in Hatree Fock, because of spin up and down
+
+    //Hartree_Fock_Solver HartFock(n_Nuclei, Z, R, Basis_Set, n_Electrons, print_stuff, rank, size);
+    E_HF = HartFock->get_Energy(toler); // Calc hartree fock energy
+    Matrix_Size = 2*HartFock->ReturnMatrixSize(); // This will be twice as big as in Hatree Fock, because of spin up and down
     unocc_orb = Matrix_Size - n_Electrons; // Number of unocupied orbitals
     mat temp_matrix;
     Speed_Elec = (int) n_Electrons/2;
     Speed_Occ = (int) unocc_orb/2;
+    Zero_Matrix = zeros(Speed_Occ, Speed_Occ); // Trying to decleare this here and we will only have to link it later
 
-    // Transform to MO basis inside the object ccint
-    coupled_cluster_integrals ccint(Matrix_Size/2, HartFock.ReturnC(), n_Electrons);
-    ccint.Mount_Indexed_Integrals(HartFock.Return_Indexed_Q());
-    ccint.Prepear_Integrals(); // Most of the 2 elekctron integrals contained here
-    fs = ccint.Return_FS(HartFock.return_eigval_F()); // eigenvalues of fock matrix
-    HartFock.Delete_Everything();
+    // Transform to MO basis, only initialize the MOs we need
+    c = HartFock->ReturnC();
+    Integrals = HartFock->Return_Indexed_Q();
+    Prepear_AOs();
+    fs = Fill_FS(HartFock->return_eigval_F());
+    HartFock = NULL; // Remove this memory,  not needed anymore
+    R.clear();
+    Z.clear();
+    //HartFock->Delete_Everything();
+
+    // First we must do some initial mapping to determine how this is gonna work
+    Map_T2_For_MPI(); // This initializes the T2 new which will be sent through MPI, and finds what parts of MO9 the different threads will need
+    Map_Part1_For_MPI(); // This function initializes everything else that MPI will need, this function consists of pretty much everything in one
 
     // We now pull out the parts of the MO basis we need, we split up the this 4D array which is a
     // n^4 array, n^4 = (n_u + n_o)^4, where n_u = unoccupied orbitals in HF basis and n_o is
     // occupied orbitals in HF basis. To the right of each term is the nr of elements stored inside it
-    integ2 = ccint.Return_Rearranged_Integrals2();    // 1/2 n_o^2 n_u^2 |
-    integ3 = ccint.Return_Rearranged_Integrals3();    // 1/4 n_u^4       |
-    integ4 = ccint.Return_Rearranged_Integrals4();    // 1/2 n_o^2 n_u^2 |
-    integ5 = ccint.Return_Rearranged_Integrals5();    // 1/2 n_u^3 n_o   |
-    integ6 = ccint.Return_Rearranged_Integrlas6();    // 1/2 n_o^3 n_u   |
-    integ7 = ccint.Return_Rearranged_Integrals7();    // 1/2 n_u^2 n_o^2 |
-    integ8 = ccint.Return_Rearranged_Integrals8();    // 1/4 n_o^4       |
-    integ9 = ccint.Return_Rearranged_Integrals9();    // 1/4 n_u^3 n_o   |
-    integ10 = ccint.Return_Rearranged_Integrals10();  // 1/2 n_u^2 n_o^2 |
 
-    /*
-     * Storing in this manner is
-     * 1/4 n_u^4 + 1/4 n_o^4 + n_u^3 n_o + 1/2 n_o^3 n_u + 2 n_o^2 n_u^2
-     *
-     * Which is a decrease in storage of >50 % compared to storing everything, exact percentage depends on system
-     *
-     * combined with all intermediates, we store:
-     *
-     *   1/4 n_u^4
-     * + 1/4 n_o^4
-     * + 3/4 n_u^3 n_o
-     * +     n_o^3 n_u
-     * + 4/2 n_o^2 n_u^2
-     * + 5/2 n_o^2 n_u^2
-     *
-     * + bunch of 2D arrays which is approx 0 in comparison
-     *
-     * Current bottleneck in transfer from coupled_cluster_integrals to here, since we store 2 (or 3) times the nr of integrals,
-     * and the intermediates right now are much smaller than the integrals. Possible non-storage of integrals next up,
-     * with storing the AO integrals (scales 1/8 * (1/2 n_o + 1/2 n_u)^4) would remove this bottleneck, but recalculation of
-     * integX's would be required in some way
-     *
-     * Further improvements in storage of intermediates uneccasary untill bottleneck removed.
-     *
-     */
+    ///////////////////////////////////
+    // SIZE OF INTEGRAL (MO) STORAGE //
+    ///////////////////////////////////
 
-    // Delete all variables inside that ccint object,
-    // hopefully this is helpful before we create our variables here
-    ccint.Delete_Everything();
+    // We store the following integrals:            // Solution to storage problems:
+    // MO9          // 1/32 n_u^2*(n_o+n_u)^2       // Distributed
+    // MO10         // 1/16 n_u*n_o*(n_o+n_u)^2     // Distributed
+    // MO6          // 1/32 n_o^2*(n_o+n_u)^2       // Possible to distribute in parallel implementation
+    // MOLeftovers  // 1/32 n_o^2 n_u^2             // Hard to distribute in parallel implementation, but smallest part of MOs, but possible
 
     // Define variables used in the CCSD method:
 
+    // Not so optimized 4D array
+    tau3.set_size(n_Electrons, n_Electrons); // 1/4 n_o^2 n_u^2 // Use this for hyperspeed, can be removed if memoryproblems
+
     // Optimized 4D arrays
-    tau4.set_size(unocc_orb, unocc_orb); // 1/2 n_o^2 n_u^2
-    t2.set_size(unocc_orb, n_Electrons); // 1/2 n_o^2 n_u^2
-    t2_new.set_size(unocc_orb, n_Electrons); // 1/2 n_o^2 n_u^2
-    W_3.set_size(n_Electrons, n_Electrons); // 1/2 n_o^3 n_u
-    W_4.set_size(unocc_orb, n_Electrons); // 1/2 n_o^2 n_u^2
-    DEN_ABIJ.set_size(unocc_orb, n_Electrons); // 1/2 n_o^2 n_u^2
+    t2.set_size(unocc_orb, n_Electrons);    // 1/4 n_o^2 n_u^2     // Must be stored!
+    // t2_new is replaced by a double**     // 1/16 n_o^2 n_u^2
+    W_1.set_size(n_Electrons, n_Electrons); // 1/4 n_o^4        // Relatively small
+    W_2.set_size(n_Electrons, n_Electrons); // 1/4 n_o^3 n_u    // Relatively small
+    W_3.set_size(n_Electrons, n_Electrons); // 3/8 n_o^3 n_u    // Relatively small
+    W_4.set_size(unocc_orb, n_Electrons);   // 1/2 n_o^2 n_u^2    // Big tits
+
+    // In total we end up storing the following leading terms of MOs (updated 28.04.13, somewhat different now, mostly smaller):
+    // n_u^4         1/32           =  0.03
+    // n_u^3 n_o     (3/32 + 1/2)   =  0.59
+    // n_u^2 n_o^2   (9/32  + 7/2)  =  3.78
+    // n_o^3 n_u     (5/8 + 3/32)   =  0.72
+    // n_o^4         1/32           =  0.03
 
     // Optimized 2D arrays
-    W_1 = zeros(n_Electrons, Speed_Elec); // This is 4D array but can be stored as 2D if updated inside T2 amplitude loops
-    W_2 = zeros(unocc_orb, Speed_Elec); // This is 4D array but can be stored as 2D if updated inside T2 amplitude loops
-    D3 = zeros(unocc_orb, Speed_Occ);
-    D2 = zeros(n_Electrons, Speed_Elec);
-    T_1 = zeros(unocc_orb, Speed_Elec);
-    T_1_new = zeros(unocc_orb, Speed_Elec);
-    D1 = zeros(unocc_orb, Speed_Elec);
-    FS_AI = zeros(unocc_orb, Speed_Elec);
-    FS_AB = zeros(unocc_orb, Speed_Occ);
-    FS_IJ = zeros(n_Electrons, Speed_Elec);
-    DEN_AI = zeros(unocc_orb, Speed_Elec);
-    tau1 = zeros(unocc_orb, Speed_Occ); // This is a 2D mapping of tau :-O
+    integ2_2D = zeros(unocc_orb, Speed_Elec); // This is used as mapping of MOs
+    integ3_2D = zeros(unocc_orb, Speed_Occ); // This is used as mapping of MOs
+    integ4_2D = zeros(unocc_orb, Speed_Occ); // This is used as mapping of MOs
+    integ5_2D = zeros(unocc_orb, Speed_Occ); // This is used as mapping of MOs
+    integ6_2D = zeros(unocc_orb, Speed_Elec); // This is used as mapping of MOs
+    integ7_2D = zeros(unocc_orb, Speed_Elec); // This is used as mapping of MOs
+    integ8_2D = zeros(n_Electrons, Speed_Elec); // This is used as mapping of MOs
+    integ9_2D = zeros(unocc_orb, Speed_Elec); // This is used as mapping of MOs
+    integ10_2D = zeros(unocc_orb, Speed_Elec); // This is used as mapping of MOs
+    D3 = zeros(unocc_orb, Speed_Occ); // F3 in text
+    D2 = zeros(n_Electrons, Speed_Elec); // F2 in text
+    T_1 = zeros(unocc_orb, Speed_Elec); // Compact storage for T1 amplitudes
+    T_1_new = zeros(unocc_orb, Speed_Elec); // Compact storage for T1 amplitudes
+    D1 = zeros(unocc_orb, Speed_Elec); // F1 in text
+    FS_AI = zeros(unocc_orb, Speed_Elec); // Compact storage even for Fock eigenvalues
+    FS_AB = zeros(unocc_orb, Speed_Occ); // Compact storage even for Fock eigenvalues
+    FS_IJ = zeros(n_Electrons, Speed_Elec); // Compact storage even for Fock eigenvalues
+    DEN_AI = zeros(unocc_orb, Speed_Elec); // This will also contain DEN_ABIJ the 4D denominator but stored as 2D for memoryconcerns
+    tau1 = zeros(n_Electrons, Speed_Elec); // 2D mapping of tau
 
     // Initialize our 4D arrays
     for (int i = 0; i < n_Electrons; i++)
     {
+        for (int j = i+1; j < n_Electrons; j++)
+        {
+            temp_matrix = zeros(unocc_orb, Speed_Occ);
+            tau3(i,j) = temp_matrix;
+
+            temp_matrix = zeros(n_Electrons, Speed_Elec);
+            W_1(i,j) = temp_matrix;
+
+            temp_matrix = zeros(unocc_orb, Speed_Elec);
+            W_2(i,j) = temp_matrix;
+        }
+    }
+
+    for (int i = 0; i < n_Electrons; i++)
+    {
         for (int j = 0; j < n_Electrons; j++)
         {
-            temp_matrix = zeros(unocc_orb, Speed_Elec);
-            W_3(i,j) = temp_matrix;
+            if ((i+j)%2 == 1)
+            {
+                temp_matrix = zeros(Speed_Occ, Speed_Elec);
+                W_3(i,j) = temp_matrix;
+            }
+
+            else
+            {
+                temp_matrix = zeros(unocc_orb, Speed_Elec);
+                W_3(i,j) = temp_matrix;
+            }
         }
     }
 
@@ -137,45 +167,25 @@ double CCSD_Memory_optimized::CCSD(double toler, bool print_stuff)
         {
             temp_matrix = zeros(unocc_orb, Speed_Elec);
             t2(i,j) = temp_matrix;
-            t2_new(i,j) = temp_matrix;
             W_4(i,j) = temp_matrix;
-            DEN_ABIJ(i,j) = temp_matrix;
-        }
-
-        for (int j = i+1; j < unocc_orb; j++)
-        {
-            temp_matrix = zeros(n_Electrons, Speed_Elec);
-            tau4(i,j) = temp_matrix;
         }
     }
 
     // Coupled Cluster is an iterative process, meaning we make an initial guess of t1 and t2 and calculate the energy
     // Then update t1 and t2 and check for convergance in the energy
 
-    // Find denominator matrix, this should not change during our calculations, stored as denom^(-1) for later matrix multiplication use
-
-    for (int a = n_Electrons; a < Matrix_Size; a++)
+    if (print_stuff == true)
     {
-        for (int i = 0; i < n_Electrons; i++)
-        {
-            for (int b = n_Electrons; b < Matrix_Size; b++)
-            {
-                for (int j = 0; j < n_Electrons; j++)
-                {
-                    if ((a+b+i+j)%2 == 0)
-                    {
-                        DEN_ABIJ(a-n_Electrons, i)((b-n_Electrons)/2 + (b-n_Electrons)%2 * Speed_Occ, j/2) = 1/(fs(i,i) + fs(j,j) - fs(a,a) - fs(b,b));
-                    }
-                }
-            }
-        }
+        cout << "No more memory needed from here!" << endl;
     }
+
+    // Find denominator matrix, this should not change during our calculations
 
     for (int a = 0; a < unocc_orb; a++)
     {
         for (int i = 0; i < n_Electrons; i++)
         {
-            DEN_AI(a/2,i/2) = 1/(fs(i,i) - fs(a+n_Electrons,a+n_Electrons));
+            DEN_AI(a/2,i/2) = (fs(i,i) - fs(a+n_Electrons,a+n_Electrons));
             i++;
         }
         a++;
@@ -185,21 +195,18 @@ double CCSD_Memory_optimized::CCSD(double toler, bool print_stuff)
     {
         for (int i = 1; i < n_Electrons; i++)
         {
-            DEN_AI(a/2+Speed_Occ,i/2) = 1/(fs(i,i) - fs(a+n_Electrons,a+n_Electrons));
+            DEN_AI(a/2+Speed_Occ,i/2) = (fs(i,i) - fs(a+n_Electrons,a+n_Electrons));
             i++;
         }
         a++;
     }
-
-
-    // Code generator up till here, also need to add AO2MO functions (<-- !)
 
     // Set up (1 - delta_pq) * fs, these calculations are the same throughout our entire calculation and
     // does not need to be recalculated. Since it is 2 dimensional arrays we can store them
     // Storing in this way reduce the number of elements stored by a factor of n_Electrons * Unoccupied_Orbitals
     // And then later we reduce this by a factor of 1/2. These terms are as far as i know always 0 in restricted HF basis CCSD with closed shells :O
     // The reason is that eigenvalues of fock matrix (fs) is on diagonal matrix form and we have 1 - delta()
-    // And also accomodates matrix matrix multiplication operations without any mapping
+    // This also accomodates matrix matrix multiplication operations without any mapping
 
     for (int i = 0; i < n_Electrons; i++)
     {
@@ -254,78 +261,37 @@ double CCSD_Memory_optimized::CCSD(double toler, bool print_stuff)
     }
 
     fs.clear(); // Dont need fs anymore
-    // Continued storage of 2D array fs makes available recalculation of DEN_ABIJ each iteration and removes required storage of this 4D array
 
     // The initial guess of t1 and t2 is made here, t1 is guessed to be 0
-    // Hypercompact form of T2
-    for (int a = 0; a < unocc_orb; a++)
+    // Compact form of T2
+
+    for (int b = 0; b < unocc_orb; b++)
     {
-        B = 0;
-        for (int b = 0; b < unocc_orb; b++)
+        for (int j = 0; j < n_Electrons; j++)
         {
-            for (int i = 0; i < n_Electrons; i++)
+            Fill_integ2_2D(b,j);
+            for (int a = 0; a < unocc_orb; a++)
             {
-                if ((a-b+i)%2 == 0)
+                for (int i = 0; i< n_Electrons; i++)
                 {
-                    J = 0;
-                    for (int j = 0; j < n_Electrons; j++)
+                    if ((a+i+b+j)%2 == 0)
                     {
-                        t2(a,i)(B,J) = integ4.at(i,j)(a/2+a%2*Speed_Occ,b/2) * DEN_ABIJ(a,i)(B,J);
-                        j++;
-                        J++;
-                    }
-                }
-
-                else
-                {
-                    J = 0;
-                    for (int j = 1; j < n_Electrons; j++)
-                    {
-                        t2(a,i)(B,J) = integ4.at(i,j)(a/2+a%2*Speed_Occ,b/2) * DEN_ABIJ(a,i)(B,J);
-                        j++;
-                        J++;
+                        t2(a,i)(b/2+b%2*Speed_Occ,j/2) = integ2_2D(a/2+a%2*Speed_Occ,i/2) / (DEN_AI(a/2+a%2*Speed_Occ,i/2) + DEN_AI(b/2+b%2*Speed_Occ,j/2));
                     }
                 }
             }
-            b++;
-            B++;
-        }
-
-        B = 0;
-        for (int b = 1; b < unocc_orb; b++)
-        {
-            for (int i = 0; i < n_Electrons; i++)
-            {
-                if ((a-b+i)%2 == 0)
-                {
-                    J = 0;
-                    for (int j = 0; j < n_Electrons; j++)
-                    {
-                        t2(a,i)(B+Speed_Occ,J) = integ4.at(i,j)(a/2+a%2*Speed_Occ,b/2) * DEN_ABIJ(a,i)(B+Speed_Occ,J);
-                        j++;
-                        J++;
-                    }
-                }
-
-                else
-                {
-                    J = 0;
-                    for (int j = 1; j < n_Electrons; j++)
-                    {
-                        t2(a,i)(B+Speed_Occ,J) = integ4.at(i,j)(a/2+a%2*Speed_Occ,b/2) * DEN_ABIJ(a,i)(B+Speed_Occ,J);
-                        j++;
-                        J++;
-                    }
-                }
-            }
-            b++;
-            B++;
         }
     }
 
     // Here starts the iteration, most calculations are taken into functions, even tho they are only called at one place
     // This is to get a more compact algo which is in my opinion more easy to read
 
+    // Define something to measure time
+    clock_t start;
+    clock_t slutt;
+    double time_measured;
+
+    Fill_tau();
     E_new = Calc_Energy(); // Starting energy, with t1=0 guess
 
     if (print_stuff == true)
@@ -335,34 +301,44 @@ double CCSD_Memory_optimized::CCSD(double toler, bool print_stuff)
 
     while (continue_ccsd == true)
     {
+        start = clock();
         E_old = E_new;
-        //E_new = 0;
 
-        // Update intermediates
-        Fill_W3();
+        // Update intermediates and find new amplitudes
+        // This is crazy implementation. Its insane..
+        Fill_F1(); // Initialize everything
+        Fill_W1_and_W3(); // Calculate everything
+        Distribute_Part1(); // Distribute everything
+        Fill_F2(); // These are the F1 * something else part
+        Fill_F3(); // These are the F1 * something else part
+
+        // These will go in parallel. Also wide functions to minimize communication.
+        // Part two of parallel implementation will be here
+        //Fill_W2(); // Moved to Fill_W1_and_W3() function
+        Fill_W4_MPI();
         Fill_W4();
-        Fill_F1();
-        Fill_F2();
-        Fill_F3();
 
-        // Find new amplitudes
-        Fill_t1_new();
-        Fill_t2_new();
+        //Fill_t1_new(); // Dont do this anymore
+        // This is part 2 of parallel implementation
+        Fill_t2_new(); // This function takes care of T1 and T2 in the parallel version of CCSD.
+        // This is to ensure we minimize communication
 
         // Update amplitudes
-        T_1 = T_1_new;
-        t2 = t2_new;
+        Map_T_new();
+        T_1 = T_1_new / DEN_AI; // This division is not in parallel, but it is n^2
+        Fill_tau(); // NOT IN PARALLEL, n^4
 
-        // Find energy, calc energy function has been put into Fill_t2_new() for more efficient storage of variables for now
-        E_new = Calc_Energy();
-        //E_new *= 0.25;
-        //E_new += accu(FS_AI % T_1);
+        // Calc energy
+        E_new = Calc_Energy(); // NOT IN PARALLEL, n^4
         iter += 1;
+
+        slutt = clock();
 
         // Output energy
         if (print_stuff == true)
         {
-            cout << "Energi: " << E_new << " Steg: " << iter << endl;
+            time_measured = (double) (slutt-start)/CLOCKS_PER_SEC;
+            cout << "Energi: " << E_new << " Steg: " << iter << " Time/iter: " << time_measured << endl;
         }
 
         // Check convergance
@@ -373,20 +349,28 @@ double CCSD_Memory_optimized::CCSD(double toler, bool print_stuff)
         }
     }
 
+    // Iterations finished, cout result and return
 
-    //cout << W_3(0,1) << endl; // Nedre halvdel 0
-    //cout << W_4(0,1) << endl; // Øvre halvdel 0
-    //cout << integ5(1,1) << endl; // Øvre halvdel 0
-    //cout << integ7(1,1) << endl; // Øvre halvdel 0
-    //cout << integ6(1,1) << endl; // Øvre halvdel 0
+    if (print_stuff == true)
+    {
+        cout << "CCSD correction [au] = " << E_new << endl;
+    }
 
-
-    cout << "CCSD correction [au] = " << E_new << endl;
     return E_new+E_HF;
 }
 
 int CCSD_Memory_optimized::EqualFunc(int a, int b)
 {
+    // Wondering if a == b? Want 1 returned if this is true? And 0 if they are different?
+    // No problem! Simply follow these easy to use and simple step by step instructions:
+
+    // Step 1: Write EqualFunc
+    // Step 2: Write thereafter (a, b), if these are the variables you wish to check
+    // Step 3: Reconsider if you didnt really want to check (a/2, b/2), or (a%2, b%2)
+
+    // This method is also eggstremely effective in problemsolving with you spouse, child or cellmate
+    // Not recomended for use during flue season or pregnancy.
+
     if (a == b)
     {
         return 1;
@@ -400,417 +384,1071 @@ int CCSD_Memory_optimized::EqualFunc(int a, int b)
 
 double CCSD_Memory_optimized::Calc_Energy()
 {
+    // Do you have a bunch of integrals and amplitudes already calculated, but no way of finding the energy in CCSD?
+    // No problem! Simply follow these step by step instructions
+
+    // Step 1: Ensure you do have tau = t2(ij,ab) + t1(ai)t1(bj) - t1(aj)t1(bi) stored
+    // Step 2: Call Calc_Energy()
+
     double E1 = 0;
     for (int i = 0; i < n_Electrons; i++)
     {
         for (int j = i+1; j < n_Electrons; j++)
         {
-            Fill_2D_tau(i,j);
-            E1 += accu(tau1 % integ4(i,j));
-            E1 -= accu(tau1 % integ4(j,i));
+            Fill_integ4_2D(i,j);
+            E1 += accu(tau3(i,j) % integ4_2D);
         }
     }
-    E1 *= 0.25;
-    E1 += accu(FS_AI % T_1); // This function only called once, when T1 is 0 in the optimized version to avoid recalculation of tau1
+    E1 *= 0.5;
+    E1 += accu(FS_AI % T_1);
     return E1;
 }
 
-void CCSD_Memory_optimized::Fill_W1(int i, int j)
+void CCSD_Memory_optimized::Fill_W1_and_W3()
 {
-    int sped, sped_j;
     // Matrix symmetric with W_1(i,j) = W_1(j,i), the terms on the "diagonal" of i==j will be equal to 0 (<-- !)
     // We actually dont even need to store anything in W_1(j,i) since it is accessed symmetricly later on also
-    // This halves our storage requirements. Also compress matrix. This reduce storage by 75% + not stored diagonal.
+    // This halves our storage requirements. Also compress matrix. This in total reduce storage by >75%
 
-    sped = i%2;
-    sped_j = j%2;
-    W_1 = integ8(i,j);
+    for (int i = 0; i < n_Electrons; i++)
+    {
+        for (int j = i+1; j < n_Electrons; j++)
+        {
+            Fill_integ8_2D(i, j);
+            W_1(i,j) = integ8_2D;
+        }
+    }
 
-            if ((i+j)%2 == 1)
+    // Optimized W_1, W_3 and parts of F1, F2, F3, T1
+
+    int K, L, E, I, J;
+
+    int index_counter;
+    int INDEX_CHECK;
+
+    index_counter = 0;
+    K = 0;
+    for (int k = 0; k < n_Electrons; k++)
+    {
+        L = 0;
+        for (int l = 1; l < k; l++)
+        {
+            INDEX_CHECK = K*Speed_Elec + Speed_Elec-L;
+
+            if (INDEX_CHECK % size == rank)
             {
+                Fill_integ6_2D(l,k);
+                Fill_integ4_2D(l,k);
 
-                for (int k = 0; k < n_Electrons; k++)
+                for (int i = 0; i < n_Electrons; i++)
                 {
-                    for (int l = 1; l < n_Electrons; l++)
-                    {
-                        W_1(k/2,l/2) += accu(integ6.at(k,l)(span(sped * Speed_Occ, sped*Speed_Occ - 1 + Speed_Occ),j/2) % T_1(span(sped*Speed_Occ, sped*Speed_Occ -1 + Speed_Occ), i/2));
-                        W_1(k/2,l/2) -= accu(integ6.at(k,l)(span(sped_j*Speed_Occ, sped_j*Speed_Occ-1+Speed_Occ), i/2) % T_1(span(sped_j*Speed_Occ, sped_j*Speed_Occ-1+Speed_Occ), j/2));
-                        W_1(k/2,l/2) += 0.5*accu(integ4.at(k,l) % tau1);
-                        l++;
-                    }
-                    k++;
+                    Part1_MPI[rank][index_counter] = accu(integ6_2D(span(Speed_Occ, Speed_Occ + Speed_Occ-1), i/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), l/2));
+                    i++;
+                    index_counter += 1;
                 }
 
-                for (int k = 1; k < n_Electrons; k++)
+                I = 0;
+                for (int i = 0; i < n_Electrons; i++)
                 {
-                    for (int l = 0; l < n_Electrons; l++)
+                    E = 0;
+                    for (int e = 1; e < unocc_orb; e++)
                     {
-                        W_1(k/2+Speed_Elec,l/2) += accu(integ6.at(k,l)(span(sped * Speed_Occ, sped*Speed_Occ - 1 + Speed_Occ),j/2) % T_1(span(sped*Speed_Occ, sped*Speed_Occ -1 + Speed_Occ), i/2));
-                        W_1(k/2+Speed_Elec,l/2) -= accu(integ6.at(k,l)(span(sped_j*Speed_Occ, sped_j*Speed_Occ-1+Speed_Occ), i/2) % T_1(span(sped_j*Speed_Occ, sped_j*Speed_Occ-1+Speed_Occ), j/2));
-                        W_1(k/2+Speed_Elec,l/2) += 0.5*accu(integ4.at(k,l) % tau1);
-                        l++;
+                        Part1_MPI[rank][index_counter] = -integ6_2D(E+Speed_Occ, I) + accu(integ4_2D(span(0, Speed_Occ-1), E) % T_1(span(0, Speed_Occ-1), I));
+                        e++;
+                        E++;
+                        index_counter += 1;
                     }
-                    k++;
+                    i++;
+                    I++;
+                }
+
+                I = 0;
+                for (int i = 1; i < n_Electrons; i++)
+                {
+                    E = 0;
+                    for (int e = 0; e < unocc_orb; e++)
+                    {
+                        Part1_MPI[rank][index_counter] = -integ6_2D(E, I) + accu(integ4_2D(span(Speed_Occ, Speed_Occ + Speed_Occ-1), E) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), I));
+                        e++;
+                        index_counter += 1;
+                        E++;
+                    }
+                    i++;
+                    I++;
+                }
+
+                I = 0;
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    J = I;
+                    for (int j = i+1; j < n_Electrons; j++)
+                    {
+                        Part1_MPI[rank][index_counter] = accu(integ6_2D(span(Speed_Occ, Speed_Occ-1+Speed_Occ), I) % T_1(span(Speed_Occ, Speed_Occ-1+Speed_Occ), J))
+                                - accu(integ6_2D(span(0, Speed_Occ-1),J) % T_1(span(0, Speed_Occ-1), I))
+                                - 0.5*accu(integ4_2D % tau3(i,j));
+                        j++;
+                        J++;
+                        index_counter += 1;
+                    }
+                    i++;
+                    I++;
+                }
+
+                I = 0;
+                for (int i = 1; i < n_Electrons; i++)
+                {
+                    J = I+1;
+                    for (int j = i+1; j < n_Electrons; j++)
+                    {
+
+                        Part1_MPI[rank][index_counter] = accu(integ6_2D(span(0, Speed_Occ-1), I) % T_1(span(0, Speed_Occ-1), J))
+                                - accu(integ6_2D(span(Speed_Occ, Speed_Occ - 1 + Speed_Occ),J) % T_1(span(Speed_Occ, Speed_Occ -1 + Speed_Occ), I))
+                                - 0.5*accu(integ4_2D % tau3(i,j));
+                        j++;
+                        J++;
+                        index_counter += 1;
+                    }
+                    i++;
+                    I++;
+                }
+            }
+            l++;
+            L++;
+        }
+
+        for (int l = k+1; l < n_Electrons; l++)
+        {
+            INDEX_CHECK = K*Speed_Elec + Speed_Elec-L;
+
+            if (INDEX_CHECK % size == rank)
+            {
+
+                Fill_integ6_2D(k,l);
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    Part1_MPI[rank][index_counter] = accu(integ6_2D(span(Speed_Occ, Speed_Occ + Speed_Occ-1), i/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), l/2));
+                    i++;
+                    index_counter += 1;
+                }
+            }
+            l++;
+            L++;
+        }
+        k++;
+        K++;
+    }
+
+    K = 0;
+    for (int k = 1; k < n_Electrons; k++)
+    {
+        L = 0;
+        for (int l = 0; l < k; l++)
+        {
+
+            INDEX_CHECK = K*Speed_Elec + Speed_Elec-L;
+
+            if (INDEX_CHECK % size == rank)
+            {
+
+                Fill_integ6_2D(l,k);
+                Fill_integ4_2D(l,k);
+
+                for (int i = 1; i < n_Electrons; i++)
+                {
+                    Part1_MPI[rank][index_counter] = accu(integ6_2D(span(0, Speed_Occ-1), i/2) % T_1(span(0, Speed_Occ-1), l/2));
+                    i++;
+                    index_counter += 1;
+                }
+
+                I = 0;
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    E = 0;
+                    for (int e = 1; e < unocc_orb; e++)
+                    {
+                        Part1_MPI[rank][index_counter] = -integ6_2D(E+Speed_Occ, I) + accu(integ4_2D(span(0, Speed_Occ-1), E) % T_1(span(0, Speed_Occ-1), I));
+                        e++;
+                        E++;
+                        index_counter += 1;
+                    }
+                    i++;
+                    I++;
+                }
+
+                I = 0;
+                for (int i = 1; i < n_Electrons; i++)
+                {
+                    E = 0;
+                    for (int e = 0; e < unocc_orb; e++)
+                    {
+                        Part1_MPI[rank][index_counter] = -integ6_2D(E, I) + accu(integ4_2D(span(Speed_Occ, Speed_Occ + Speed_Occ-1), E) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), I));
+                        e++;
+                        E++;
+                        index_counter += 1;
+                    }
+                    i++;
+                    I++;
+                }
+
+                I = 0;
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    J = I;
+                    for (int j = i+1; j < n_Electrons; j++)
+                    {
+                        Part1_MPI[rank][index_counter] = accu(integ6_2D(span(Speed_Occ, Speed_Occ-1+Speed_Occ), I) % T_1(span(Speed_Occ, Speed_Occ-1+Speed_Occ), J))
+                                - accu(integ6_2D(span(0, Speed_Occ-1),J) % T_1(span(0, Speed_Occ-1), I))
+                                - 0.5*accu(integ4_2D % tau3(i,j));
+                        index_counter += 1;
+                        j++;
+                        J++;
+                    }
+                    i++;
+                    I++;
+                }
+
+                I = 0;
+                for (int i = 1; i < n_Electrons; i++)
+                {
+                    J = I+1;
+                    for (int j = i+1; j < n_Electrons; j++)
+                    {
+                        Part1_MPI[rank][index_counter] = accu(integ6_2D(span(0, Speed_Occ-1), I) % T_1(span(0, Speed_Occ-1), J))
+                                - accu(integ6_2D(span(Speed_Occ, Speed_Occ - 1 + Speed_Occ),J) % T_1(span(Speed_Occ, Speed_Occ -1 + Speed_Occ), I))
+                                - 0.5*accu(integ4_2D % tau3(i,j));
+                        index_counter += 1;
+                        j++;
+                        J++;
+                    }
+                    i++;
+                    I++;
                 }
             }
 
-            else
+            L++;
+            l++;
+        }
+
+        for (int l = k+1; l < n_Electrons; l++)
+        {
+            INDEX_CHECK = K*Speed_Elec + Speed_Elec-L;
+
+            if (INDEX_CHECK % size == rank)
             {
-                for (int k = 0; k < n_Electrons; k++)
+
+                Fill_integ6_2D(k,l);
+
+                for (int i = 1; i < n_Electrons; i++)
                 {
-                    for (int l = 0; l < n_Electrons; l++)
-                    {
-                        W_1(k/2,l/2) += accu(integ6.at(k,l)(span(sped * Speed_Occ, sped*Speed_Occ - 1 + Speed_Occ),j/2) % T_1(span(sped*Speed_Occ, sped*Speed_Occ -1 + Speed_Occ), i/2));
-                        W_1(k/2,l/2) -= accu(integ6.at(k,l)(span(sped_j*Speed_Occ, sped_j*Speed_Occ-1+Speed_Occ), i/2) % T_1(span(sped_j*Speed_Occ, sped_j*Speed_Occ-1+Speed_Occ), j/2));
-                        W_1(k/2,l/2) += 0.5*accu(integ4.at(k,l) % tau1);
-                        l++;
-                    }
-                    k++;
-                }
-
-                for (int k = 1; k < n_Electrons; k++)
-                {
-                    for (int l = 1; l < n_Electrons; l++)
-                    {
-                        W_1(k/2+Speed_Elec,l/2) += accu(integ6.at(k,l)(span(sped * Speed_Occ, sped*Speed_Occ - 1 + Speed_Occ),j/2) % T_1(span(sped*Speed_Occ, sped*Speed_Occ -1 + Speed_Occ), i/2));
-                        W_1(k/2+Speed_Elec,l/2) -= accu(integ6.at(k,l)(span(sped_j*Speed_Occ, sped_j*Speed_Occ-1+Speed_Occ), i/2) % T_1(span(sped_j*Speed_Occ, sped_j*Speed_Occ-1+Speed_Occ), j/2));
-                        W_1(k/2+Speed_Elec,l/2) += 0.5*accu(integ4.at(k,l) % tau1);
-
-                        //if (accu(integ6.at(k,l)(span(sped * Speed_Occ, sped*Speed_Occ - 1 + Speed_Occ),j/2) % T_1(span(sped*Speed_Occ, sped*Speed_Occ -1 + Speed_Occ), i/2)) == 0)
-                        //{
-                            //cout << "sup?" << endl;
-                        //}
-
-                        l++;
-                    }
-                    k++;
+                    Part1_MPI[rank][index_counter] = accu(integ6_2D(span(0, Speed_Occ-1), i/2) % T_1(span(0, Speed_Occ-1), l/2));
+                    i++;
+                    index_counter += 1;
                 }
             }
+            l++;
+            L++;
+        }
+        k++;
+        K++;
+    }
+
+    K = 0;
+    for (int k = 0; k < n_Electrons; k++)
+    {
+        L = 0;
+        for (int l = 0; l < k+1; l++)
+        {
+            INDEX_CHECK = K*Speed_Elec + Speed_Elec-L;
+
+            if (INDEX_CHECK % size == rank)
+            {
+
+                Fill_integ6_2D(l,k);
+                Fill_integ4_2D(l,k);
+
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    Part1_MPI[rank][index_counter] = accu(integ6_2D(span(0, Speed_Occ-1), i/2) % T_1(span(0, Speed_Occ-1), l/2));
+                    i++;
+                    index_counter += 1;
+                }
+
+                I = 0;
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    E = 0;
+                    for (int e = 0; e < unocc_orb; e++)
+                    {
+                        Part1_MPI[rank][index_counter] = -integ6_2D(E, I) + accu(integ4_2D(span(0, Speed_Occ-1), E) % T_1(span(0, Speed_Occ-1), I));
+                        index_counter += 1;
+                        e++;
+                        E++;
+                    }
+                    i++;
+                    I++;
+                }
+
+                I = 0;
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    J = I+1;
+                    for (int j = i+2; j < n_Electrons; j++)
+                    {
+                        Part1_MPI[rank][index_counter] = accu(integ6_2D(span(0, Speed_Occ-1),I) % T_1(span(0, Speed_Occ-1), J))
+                                - accu(integ6_2D(span(0, Speed_Occ-1),J) % T_1(span(0, Speed_Occ-1), I))
+                                - 0.5*accu(integ4_2D % tau3(i,j));
+                        index_counter += 1;
+                        j++;
+                        J++;
+                    }
+                    i++;
+                    I++;
+                }
+            }
+
+            l++;
+            L++;
+        }
+
+        for (int l = k+2; l < n_Electrons; l++)
+        {
+            INDEX_CHECK = K*Speed_Elec + Speed_Elec-L;
+
+            if (INDEX_CHECK % size == rank)
+            {
+                Fill_integ6_2D(k,l);
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    Part1_MPI[rank][index_counter] = accu(integ6_2D(span(0, Speed_Occ-1), i/2) % T_1(span(0, Speed_Occ-1), l/2));
+                    i++;
+                    index_counter += 1;
+                }
+            }
+            l++;
+            L++;
+        }
+        k++;
+        K++;
+    }
+
+    K = 0;
+    for (int k = 1; k < n_Electrons; k++)
+    {
+        L = 0;
+        for (int l = 1; l < k+1; l++)
+        {
+            INDEX_CHECK = K*Speed_Elec + Speed_Elec-L;
+
+            if (INDEX_CHECK % size == rank)
+            {
+
+                Fill_integ6_2D(l,k);
+                Fill_integ4_2D(l,k);
+
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    Part1_MPI[rank][index_counter] = accu(integ6_2D(span(Speed_Occ, Speed_Occ + Speed_Occ-1), i/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), l/2));
+                    i++;
+                    index_counter += 1;
+                }
+
+                I = 0;
+                for (int i = 1; i < n_Electrons; i++)
+                {
+                    E = 0;
+                    for (int e = 1; e < unocc_orb; e++)
+                    {
+                        Part1_MPI[rank][index_counter] = -integ6_2D(E+Speed_Occ, I) + accu(integ4_2D(span(Speed_Occ, Speed_Occ + Speed_Occ-1), E) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), I));
+                        e++;
+                        E++;
+                        index_counter += 1;
+                    }
+                    i++;
+                    I++;
+                }
+
+                I = 0;
+                for (int i = 1; i < n_Electrons; i++)
+                {
+                    J = I+1;
+                    for (int j = i+2; j < n_Electrons; j++)
+                    {
+                        Part1_MPI[rank][index_counter] = accu(integ6_2D(span(Speed_Occ, Speed_Occ-1+Speed_Occ), I) % T_1(span(Speed_Occ, Speed_Occ-1+Speed_Occ), J))
+                                -  accu(integ6_2D(span(Speed_Occ, Speed_Occ - 1 + Speed_Occ),J) % T_1(span(Speed_Occ, Speed_Occ -1 + Speed_Occ), I))
+                                 - 0.5*accu(integ4_2D % tau3(i,j));
+                        j++;
+                        J++;
+                        index_counter += 1;
+                    }
+                    i++;
+                    I++;
+                }
+            }
+
+            l++;
+            L++;
+        }
+
+        for (int l = k+2; l < n_Electrons; l++)
+        {
+
+            INDEX_CHECK = K*Speed_Elec + Speed_Elec-L;
+
+            if (INDEX_CHECK % size == rank)
+            {
+                Fill_integ6_2D(k,l);
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    Part1_MPI[rank][index_counter] = accu(integ6_2D(span(Speed_Occ, Speed_Occ + Speed_Occ-1), i/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), l/2));
+                    i++;
+                    index_counter += 1;
+                }
+            }
+            l++;
+            L++;
+        }
+        k++;
+        K++;
+    }
+
+
+
+
+
+
+
+    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
+    /// Now add W_2 and D_2 and D_3 and D1
+    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
+
+    for (int i = 0; i < n_Electrons; i++)
+    {
+        for (int j = i+1; j < n_Electrons; j++)
+        {
+            Fill_integ6_2D(i,j);
+            for (int k = 0; k < unocc_orb; k++)
+            {
+                for (int l = 0; l < Speed_Elec; l++)
+                {
+                    W_2(i,j)(k,l) = integ6_2D(k,l);
+                }
+            }
+        }
+    }
+
+    int A, M;
+
+    // Optimized W_2 version
+    A = 0;
+    for (int a = 0; a < unocc_orb; a++)
+    {
+        M = 0;
+        for (int m = 0; m < n_Electrons; m++)
+        {
+
+            INDEX_CHECK = a/2*Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+
+                Fill_integ7_2D(a, m);
+                Fill_integ5_2D(a, m);
+
+                for (int e = 0; e < unocc_orb; e++)
+                {
+                    Part1_MPI[rank][index_counter] = accu(integ5_2D(e/2, span()) % T_1(span(0, Speed_Occ-1), m/2).t());
+                    index_counter += 1;
+                    e++;
+                }
+
+                I = 0;
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    J = I+1;
+                    for (int j = i+2; j < n_Electrons; j++)
+                    {
+                        Part1_MPI[rank][index_counter] = accu(integ7_2D(span(0, Speed_Occ-1), J) % T_1(span(0, Speed_Occ-1),I))
+                                - accu(integ7_2D(span(0, Speed_Occ-1), I) % T_1(span(0, Speed_Occ-1),J))
+                                + 0.5*accu(integ5_2D % tau3(i,j));
+                        index_counter += 1;
+                        j++;
+                        J++;
+                    }
+                    i++;
+                    I++;
+                }
+            }
+            m++;
+            M++;
+        }
+        a++;
+        A++;
+    }
+
+    A = 0;
+    for (int a = 1; a < unocc_orb; a++)
+    {
+        M = 0;
+        for (int m = 1; m < n_Electrons; m++)
+        {
+            INDEX_CHECK = a/2*Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+
+                Fill_integ7_2D(a, m);
+                Fill_integ5_2D(a, m);
+
+                for (int e = 1; e < unocc_orb; e++)
+                {
+                    Part1_MPI[rank][index_counter] = accu(integ5_2D(e/2+Speed_Occ, span()) % T_1(span(Speed_Occ, unocc_orb-1), m/2).t());
+                    e++;
+                    index_counter += 1;
+                }
+
+                I = 0;
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    J = I+1;
+                    for (int j = i+2; j < n_Electrons; j++)
+                    {
+                        Part1_MPI[rank][index_counter] = accu(integ7_2D(span(0, Speed_Occ-1), J) % T_1(span(0, Speed_Occ-1),I))
+                                - accu(integ7_2D(span(0, Speed_Occ-1), I) % T_1(span(0, Speed_Occ-1),J))
+                                + 0.5*accu(integ5_2D % tau3(i,j));
+                        index_counter += 1;
+                        j++;
+                        J++;
+                    }
+                    i++;
+                    I++;
+                }
+
+                I = 0;
+                for (int i = 1; i < n_Electrons; i++)
+                {
+                    J = I+1;
+                    for (int j = i+2; j < n_Electrons; j++)
+                    {
+                        Part1_MPI[rank][index_counter] = accu(integ7_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), J) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1),I))
+                                - accu(integ7_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), I) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1),J))
+                                + 0.5*accu(integ5_2D % tau3(i,j));
+                        index_counter += 1;
+                        j++;
+                        J++;
+                    }
+                    i++;
+                    I++;
+                }
+            }
+
+            M++;
+            m++;
+        }
+        a++;
+        A++;
+    }
+
+    A = 0;
+    for (int a = 1; a < unocc_orb; a++)
+    {
+        M = 0;
+        for (int m = 0; m < n_Electrons; m++)
+        {
+            INDEX_CHECK = a/2*Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+
+                Fill_integ7_2D(a, m);
+                Fill_integ5_2D(a, m);
+
+
+                for (int e = 1; e < unocc_orb; e++)
+                {
+                    Part1_MPI[rank][index_counter] = accu(integ5_2D(e/2+Speed_Occ, span()) % T_1(span(0, Speed_Occ-1), m/2).t());
+                    e++;
+                    index_counter += 1;
+                }
+
+                I = 0;
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    J = I;
+                    for (int j = i+1; j < n_Electrons; j++)
+                    {
+                        Part1_MPI[rank][index_counter] = accu(integ7_2D(span(0, Speed_Occ-1), J) % T_1(span(0, Speed_Occ-1),I))
+                                - accu(integ7_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), I) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1),J))
+                                + 0.5*accu(integ5_2D % tau3(i,j));
+                        index_counter += 1;
+                        j++;
+                        J++;
+                    }
+                    i++;
+                    I++;
+                }
+
+                I = 0;
+                for (int i = 1; i < n_Electrons; i++)
+                {
+                    J = I+1;
+                    for (int j = i+1; j < n_Electrons; j++)
+                    {
+                        Part1_MPI[rank][index_counter] = accu(integ7_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), J) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1),I))
+                                - accu(integ7_2D(span(0, Speed_Occ-1), I) % T_1(span(0, Speed_Occ-1),J))
+                                + 0.5*accu(integ5_2D % tau3(i,j));
+                        index_counter += 1;
+                        j++;
+                        J++;
+                    }
+                    i++;
+                    I++;
+                }
+            }
+            m++;
+            M++;
+        }
+        a++;
+        A++;
+    }
+
+    A = 0;
+    for (int a = 0; a < unocc_orb; a++)
+    {
+        M = 0;
+        for (int m = 1; m < n_Electrons; m++)
+        {
+
+            INDEX_CHECK = a/2*Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+
+                Fill_integ5_2D(a,m);
+                Fill_integ7_2D(a,m);
+
+                for (int e = 0; e < unocc_orb; e++)
+                {
+                    Part1_MPI[rank][index_counter] = accu(integ5_2D(e/2, span()) % T_1(span(Speed_Occ, unocc_orb-1), m/2).t());
+                    index_counter += 1;
+                    e++;
+                }
+
+                I = 0;
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    J = I;
+                    for (int j = i+1; j < n_Electrons; j++)
+                    {
+                        Part1_MPI[rank][index_counter] = accu(integ7_2D(span(0, Speed_Occ-1), J) % T_1(span(0, Speed_Occ-1),I))
+                                - accu(integ7_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), I) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1),J))
+                                + 0.5*accu(integ5_2D % tau3(i,j));
+                        index_counter += 1;
+                        j++;
+                        J++;
+                    }
+                    i++;
+                    I++;
+                }
+
+                I = 0;
+                for (int i = 1; i < n_Electrons; i++)
+                {
+                    J = I+1;
+                    for (int j = i+1; j < n_Electrons; j++)
+                    {
+                        Part1_MPI[rank][index_counter] = accu(integ7_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), J) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1),I))
+                                - accu(integ7_2D(span(0, Speed_Occ-1), I) % T_1(span(0, Speed_Occ-1),J))
+                                + 0.5*accu(integ5_2D % tau3(i,j));
+                        index_counter += 1;
+                        j++;
+                        J++;
+                    }
+                    i++;
+                    I++;
+                }
+            }
+            m++;
+            M++;
+        }
+        a++;
+        A++;
+    }
+
+    for (int e = 0; e < unocc_orb; e++)
+    {
+        for (int m = 0; m < n_Electrons; m++)
+        {
+            INDEX_CHECK = e/2*Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+                Fill_integ2_2D(e,m);
+                for (int i = 0; i < n_Electrons; i++)
+                {
+                    Part1_MPI[rank][index_counter] = 0.5*accu(integ2_2D % t2.at(e,i));
+                    index_counter += 1;
+                    i++;
+                }
+            }
+            m++;
+        }
+    }
+
+    for (int e = 0; e < unocc_orb; e++)
+    {
+        for (int m = 1; m < n_Electrons; m++)
+        {
+            INDEX_CHECK = e/2*Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+                Fill_integ2_2D(e,m);
+                for (int i = 1; i < n_Electrons; i++)
+                {
+                    Part1_MPI[rank][index_counter] = 0.5*accu(integ2_2D % t2.at(e,i));
+                    index_counter += 1;
+                    i++;
+                }
+            }
+            m++;
+        }
+    }
+
+
+    for (int e = 0; e < unocc_orb; e++)
+    {
+        for (int m = 0; m < n_Electrons; m++)
+        {
+            INDEX_CHECK = e/2 * Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+                Fill_integ2_2D(e,m);
+
+                // F1 term
+                Part1_MPI[rank][index_counter] = accu(integ2_2D % T_1);
+                index_counter += 1;
+
+                for (int a = 0; a < unocc_orb; a++)
+                {
+                    Part1_MPI[rank][index_counter] = 0.5*accu(integ2_2D % t2.at(a,m));
+                    index_counter += 1;
+                    a++;
+                }
+            }
+            m++;
+        }
+        e++;
+    }
+
+    for (int e = 0; e < unocc_orb; e++)
+    {
+        for (int m = 1; m < n_Electrons; m++)
+        {
+            INDEX_CHECK = e/2 * Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+                Fill_integ2_2D(e,m);
+                for (int a = 0; a < unocc_orb; a++)
+                {
+                    Part1_MPI[rank][index_counter] = 0.5*accu(integ2_2D(span(Speed_Occ, unocc_orb-1), span()) % t2.at(a,m)(span(Speed_Occ, unocc_orb-1), span()));
+                    index_counter += 1;
+                    a++;
+                }
+            }
+            m++;
+        }
+        e++;
+    }
+
+    for (int e = 1; e < unocc_orb; e++)
+    {
+        for (int m = 0; m < n_Electrons; m++)
+        {
+            INDEX_CHECK = e/2 * Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+                Fill_integ2_2D(e,m);
+                for (int a = 1; a < unocc_orb; a++)
+                {
+                    Part1_MPI[rank][index_counter] = 0.5*accu(integ2_2D(span(0,Speed_Occ-1), span()) % t2.at(a,m)(span(0,Speed_Occ-1), span()));
+                    index_counter += 1;
+                    a++;
+                }
+            }
+            m++;
+        }
+        e++;
+    }
+
+    for (int e = 1; e < unocc_orb; e++)
+    {
+        for (int m = 1; m < n_Electrons; m++)
+        {
+            INDEX_CHECK = e/2 * Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+                Fill_integ2_2D(e,m);
+
+                // F1 term
+                Part1_MPI[rank][index_counter] = accu(integ2_2D % T_1);
+                index_counter += 1;
+
+                for (int a = 1; a < unocc_orb; a++)
+                {
+                    Part1_MPI[rank][index_counter] = 0.5*accu(integ2_2D % t2.at(a,m));
+                    index_counter += 1;
+                    a++;
+                }
+            }
+            m++;
+        }
+        e++;
+    }
+
+
+
+
+    for (int a = 0; a < unocc_orb; a++)
+    {
+        for (int k = 0; k < n_Electrons; k++)
+        {
+            INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - k/2;
+            if (INDEX_CHECK % size == rank)
+            {
+                Fill_integ5_2D(a, k);
+                for (int i = 0; i < k; i++)
+                {
+                    Part1_MPI[rank][index_counter] = 0.5*accu(integ5_2D % tau3(i,k));
+                    index_counter += 1;
+                    i++;
+                }
+
+                // i will be less than k when k = odd number
+                // We want i to be an even number since a is even number, hence we start at i = k+1
+                for (int i = (k+1+(k+1)%2); i < n_Electrons; i++)
+                {
+                    Part1_MPI[rank][index_counter] = -0.5*accu(integ5_2D % tau3(k,i));
+                    index_counter += 1;
+                    i++;
+                }
+            }
+        }
+        a++;
+    }
+
+    for (int a = 1; a < unocc_orb; a++)
+    {
+        for (int k = 0; k < n_Electrons; k++)
+        {
+            INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - k/2;
+            if (INDEX_CHECK % size == rank)
+            {
+                Fill_integ5_2D(a, k);
+                for (int i = 1; i < k; i++)
+                {
+                    Part1_MPI[rank][index_counter] = 0.5*accu(integ5_2D % tau3(i,k));
+                    index_counter += 1;
+                    i++;
+                }
+
+                // i will be less than k when k = even number
+                // We want i to be an odd number since a is an odd number, hence we start at i = k+1
+                for (int i = k+1+(k)%2; i < n_Electrons; i++)
+                {
+                    Part1_MPI[rank][index_counter] = -0.5*accu(integ5_2D % tau3(k,i));
+                    index_counter += 1;
+                    i++;
+                }
+            }
+        }
+        a++;
+    }
+
+
+    // Communicate
+    int work;
+    for (int X = 0; X < size; X++)
+    {
+        work = WORK_EACH_NODE_Part1(X);
+        MPI_Bcast(Part1_MPI[X], work, MPI_DOUBLE, X, MPI_COMM_WORLD);
+    }
 }
 
-void CCSD_Memory_optimized::Fill_W2(int i, int j)
+void CCSD_Memory_optimized::Fill_W2()
 {
     // Matrix symmetric with W_2(i,j) = -W_2(j,i) and always 0 on the diagonal where i == j (<-- !)
     // Since symmetry is used later on also W_2(j,i) can be whatever, we do not need to access this ever
     // This halves our storage requirements, also compress matrix = reduce storage 75% + nothing on diagonal
 
-            W_2 = integ6.at(i,j);
-
-            if ((i+j)%2==0)
-            {
-                for (int a = 0; a < unocc_orb; a++)
-                {
-                    for (int m = 0; m < n_Electrons; m++)
-                    {
-                        if (i%2 != 1 && j%2 != 1)
-                        {
-                            W_2(a/2+a%2*Speed_Occ,m/2) += accu(integ7.at(a,m)(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1), j/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1),i/2));
-                            W_2(a/2+a%2*Speed_Occ,m/2) -= accu(integ7.at(a,m)(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1), i/2) % T_1(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1),j/2));
-                            W_2(a/2+a%2*Speed_Occ,m/2) += 0.5*accu(integ5.at(a,m) % tau1);
-                        }
-                        m++;
-                    }
-                    a++;
-                }
-
-                for (int a = 1; a < unocc_orb; a++)
-                {
-                    for (int m = 1; m < n_Electrons; m++)
-                    {
-                        //  disse kommer til å ha en slags symmetri
-                        W_2(a/2+a%2*Speed_Occ,m/2) += accu(integ7.at(a,m)(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1), j/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1),i/2));
-                        W_2(a/2+a%2*Speed_Occ,m/2) -= accu(integ7.at(a,m)(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1), i/2) % T_1(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1),j/2));
-                        W_2(a/2+a%2*Speed_Occ,m/2) += 0.5*accu(integ5.at(a,m) % tau1);
-                        m++;
-                    }
-                    a++;
-                }
-            }
-
-            else
-            {
-                for (int a = 1; a < unocc_orb; a++)
-                {
-                    for (int m = 0; m < n_Electrons; m++)
-                    {
-                        W_2(a/2+a%2*Speed_Occ,m/2) += accu(integ7.at(a,m)(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1), j/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1),i/2));
-                        W_2(a/2+a%2*Speed_Occ,m/2) -= accu(integ7.at(a,m)(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1), i/2) % T_1(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1),j/2));
-                        W_2(a/2+a%2*Speed_Occ,m/2) += 0.5*accu(integ5.at(a,m) % tau1);
-                        m++;
-                    }
-                    a++;
-                }
-
-                for (int a = 0; a < unocc_orb; a++)
-                {
-                    for (int m = 1; m < n_Electrons; m++)
-                    {
-                        W_2(a/2+a%2*Speed_Occ,m/2) += accu(integ7.at(a,m)(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1), j/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1),i/2));
-                        W_2(a/2+a%2*Speed_Occ,m/2) -= accu(integ7.at(a,m)(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1), i/2) % T_1(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1),j/2));
-                        W_2(a/2+a%2*Speed_Occ,m/2) += 0.5*accu(integ5.at(a,m) % tau1);
-                        m++;
-                    }
-                    a++;
-                }
-            }
-}
-
-void CCSD_Memory_optimized::Fill_W3()
-{
-    // Intersting function here. m and n is symmetric, which we will utilize
-    // at the same time as we compress the matrixes to half size as usual
-    int E,N;
-
-    for (int m = 0; m < n_Electrons; m++)
-    {
-        for (int i = 0; i < n_Electrons; i++)
-        {
-            if ((m+i)%2 == 0)
-            {
-                E = 0;
-                for (int e = 0; e < unocc_orb; e++)
-                {
-                    N = 0;
-                    for (int n = 0; n < n_Electrons; n++)
-                    {
-                        W_3(i,m)(E,N) = integ6.at(m,n)(e/2+e%2*Speed_Occ, i/2);
-                        W_3(i,m)(E,N) -= accu(integ4.at(m,n)(span(i%2*Speed_Occ, i%2*Speed_Occ + Speed_Occ-1), e/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1), i/2));
-                        //if (n != m)
-                        //{
-                        //    W_3(i,n)(E,m/2) = -W_3(i,m)(E,N);
-                        //}
-                        N++;
-                        n++;
-                    }
-                    E++;
-                    e++;
-                }
-
-                E = 0;
-                for (int e = 1; e < unocc_orb; e++)
-                {
-                    N = 0;
-                    for (int n = 1; n < n_Electrons; n++)
-                    {
-                        W_3(i,m)(E+Speed_Occ,N) = integ6.at(m,n)(e/2+e%2*Speed_Occ, i/2);
-                        W_3(i,m)(E+Speed_Occ,N) -= accu(integ4.at(m,n)(span(i%2*Speed_Occ, i%2*Speed_Occ + Speed_Occ-1), e/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1), i/2));
-                        //if (n != m)
-                        //{
-                        //    W_3(i,n)(E+Speed_Occ,m/2) = -W_3(i,m)(E+Speed_Occ,N);
-                        //}
-                        N++;
-                        n++;
-                    }
-                    E++;
-                    e++;
-                }
-            }
-
-            else
-            {
-                if (i%2 != 0 && m%2 != 1)
-                {
-                    E = 0;
-                    for (int e = 0; e < unocc_orb; e++)
-                    {
-                        N = 0;
-                        for (int n = 1; n < n_Electrons; n++)
-                        {
-                            W_3(i,m)(E,N) = integ6.at(m,n)(e/2+e%2*Speed_Occ, i/2);
-                            W_3(i,m)(E,N) -= accu(integ4.at(m,n)(span(i%2*Speed_Occ, i%2*Speed_Occ + Speed_Occ-1), e/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1), i/2));
-                            //if (n != m)
-                            //{
-                            //    W_3(i,n)(E,m/2) = -W_3(i,m)(E,N);
-                            //}
-                            N++;
-                            n++;
-                        }
-                        E++;
-                        e++;
-                    }
-                }
-
-                if (i%2 != 1 && m%2 != 0)
-                {
-                    E = 0;
-                    for (int e = 1; e < unocc_orb; e++)
-                    {
-                        N = 0;
-                        for (int n = 0; n < n_Electrons; n++)
-                        {
-                            W_3(i,m)(E+Speed_Occ,N) = integ6.at(m,n)(e/2+e%2*Speed_Occ, i/2);
-                            W_3(i,m)(E+Speed_Occ,N) -= accu(integ4.at(m,n)(span(i%2*Speed_Occ, i%2*Speed_Occ + Speed_Occ-1), e/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1), i/2));
-                            //if (n != m)
-                            //{
-                            //    W_3(i,n)(E+Speed_Occ,m/2) = -W_3(i,m)(E+Speed_Occ,N);
-                            //}
-                            N++;
-                            n++;
-                        }
-                        E++;
-                        e++;
-                    }
-                }
-            }
-        }
-    }
+    // This part is done in Fill_W1_And_W3 because faster with MPI this way
 }
 
 void CCSD_Memory_optimized::Fill_W4()
 {
-    int M, E;
+    //int M, E;
 
     // We only need to calculate the terms of W_4 of which t2 amplitudes is not equal to 0 later on
     // since W_4 only appear one place, in which it is multiplied by t2 on a accumulative basis
+    // We can in fact skip a bunch of calculations using this
 
-    for (int a = 0; a < unocc_orb; a++)
+    int index_counter, INDEX_CHECK;
+
+    for (int K = 0; K < size; K++)
     {
-        for (int i = 0; i < n_Electrons; i++)
+        index_counter = 0;
+        for (int a = 0; a < unocc_orb; a++)
         {
-            E = 0;
-            for (int e = 0; e < unocc_orb; e++)
+            for (int m = 0; m < n_Electrons; m++)
             {
-                if ((a-e+i)%2 == 0)
+                INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - m/2;
+                if (INDEX_CHECK % size == K)
                 {
-                    M = 0;
-                    for (int m = 0; m < n_Electrons; m++)
+                    for (int e = 0; e < unocc_orb; e++)
                     {
-                        W_4.at(a,i).at(E,M) = -integ7.at(a,m)(e/2,i/2);
-                        W_4.at(a,i).at(E,M) -= accu(W_3.at(i,m)(e/2+e%2*Speed_Occ,span()) % T_1.row(a/2+a%2*Speed_Occ));
-                        W_4.at(a,i).at(E,M) += accu(integ5.at(a,m)(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1),e/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1),i/2));
-                        W_4.at(a,i).at(E,M) += 0.5*accu(integ2.at(e,m) % t2.at(a,i));
-                        m++;
-                        M++;
+                        for(int i = 0; i < n_Electrons; i++)
+                        {
+                            W_4(a,i)(e/2,m/2) = Part1_MPI[K][index_counter];
+                            index_counter += 1;
+                            i++;
+                        }
+                        e++;
                     }
                 }
-
-                else
-                {
-
-                    M = 0;
-                    for (int m = 1; m < n_Electrons; m++)
-                    {
-                        W_4.at(a,i).at(E,M) = -integ7.at(a,m)(e/2,i/2);
-
-                        if (i%2 != 0)
-                        {
-                            W_4.at(a,i).at(E,M) -= accu(W_3.at(i,m)(e/2+e%2*Speed_Occ,span()) % T_1.row(a/2+a%2*Speed_Occ));
-                        }
-
-                        if (a%2 != 1)
-                        {
-                            W_4.at(a,i).at(E,M) += accu(integ5.at(a,m)(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1),e/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1),i/2));
-                        }
-                        W_4.at(a,i).at(E,M) += 0.5*accu(integ2.at(e,m) % t2.at(a,i));
-                        m++;
-                        M++;
-                    }
-                }
-                e++;
-                E++;
+                m++;
             }
+            a++;
         }
 
-        E = 0;
-        for (int e = 1; e < unocc_orb; e++)
+        for (int a = 1; a < unocc_orb; a++)
         {
-            for (int i = 0; i < n_Electrons; i++)
+            for (int m = 0; m < n_Electrons; m++)
             {
-                if ((a-e+i)%2 == 0)
+                INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - m/2;
+                if (INDEX_CHECK % size == K)
                 {
-                    M = 0;
-                    for (int m = 0; m < n_Electrons; m++)
+                    for (int e = 0; e < unocc_orb; e++)
                     {
-                        if (a%2 != 0 && i%2 != 1)
+                        for (int i = 1; i < n_Electrons; i++)
                         {
-                            W_4.at(a,i).at(E+Speed_Occ,M) = -integ7.at(a,m)(e/2+Speed_Occ,i/2);
-                            W_4.at(a,i).at(E+Speed_Occ,M) -= accu(W_3.at(i,m)(e/2+e%2*Speed_Occ,span()) % T_1.row(a/2+a%2*Speed_Occ));
-                            W_4.at(a,i).at(E+Speed_Occ,M) += accu(integ5.at(a,m)(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1),e/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1),i/2));
-                            W_4.at(a,i).at(E+Speed_Occ,M) += 0.5*accu(integ2.at(e,m) % t2.at(a,i));
+                            W_4(a,i)(e/2,m/2) = Part1_MPI[K][index_counter];
+                            index_counter += 1;
+                            i++;
                         }
-                        m++;
-                        M++;
+                        e++;
                     }
-                }
 
-                else
-                {
-                    M = 0;
-                    for (int m = 1; m < n_Electrons; m++)
+                    for (int e = 1; e < unocc_orb; e++)
                     {
-                        W_4.at(a,i).at(E+Speed_Occ,M) = -integ7.at(a,m)(e/2+Speed_Occ,i/2);
-                        W_4.at(a,i).at(E+Speed_Occ,M) -= accu(W_3.at(i,m)(e/2+e%2*Speed_Occ,span()) % T_1.row(a/2+a%2*Speed_Occ));
-                        W_4.at(a,i).at(E+Speed_Occ,M) += accu(integ5.at(a,m)(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1),e/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1),i/2));
-                        W_4.at(a,i).at(E+Speed_Occ,M) += 0.5*accu(integ2.at(e,m) % t2.at(a,i));
-                        m++;
-                        M++;
+                        for (int i = 0; i < n_Electrons; i++)
+                        {
+                            W_4(a,i)(e/2+Speed_Occ,m/2) = Part1_MPI[K][index_counter];
+                            index_counter += 1;
+                            i++;
+                        }
+                        e++;
                     }
                 }
+                m++;
             }
-            e++;
-            E++;
+            a++;
+        }
+
+        for (int a = 0; a < unocc_orb; a++)
+        {
+            for (int m = 1; m < n_Electrons; m++)
+            {
+                INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - m/2;
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int e = 0; e < unocc_orb; e++)
+                    {
+                        for (int i = 1; i < n_Electrons; i++)
+                        {
+                            W_4(a,i)(e/2,m/2) = Part1_MPI[K][index_counter];
+                            i++;
+                            index_counter += 1;
+                        }
+                        e++;
+                    }
+
+                    for (int e = 1; e < unocc_orb; e++)
+                    {
+                        for (int i = 0; i < n_Electrons; i++)
+                        {
+                            W_4(a,i)(e/2+Speed_Occ, m/2) = Part1_MPI[K][index_counter];
+                            i++;
+                            index_counter += 1;
+                        }
+                        e++;
+                    }
+                }
+                m++;
+            }
+            a++;
+        }
+
+        for (int a = 1; a < unocc_orb; a++)
+        {
+            for (int m = 1; m < n_Electrons; m++)
+            {
+                INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - m/2;
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int e = 0; e < unocc_orb; e++)
+                    {
+                        for (int i = 0; i < n_Electrons; i++)
+                        {
+                            W_4(a,i)(e/2,m/2) = Part1_MPI[K][index_counter];
+                            i++;
+                            index_counter += 1;
+                        }
+                        e++;
+                    }
+
+                    for (int e = 1; e < unocc_orb; e++)
+                    {
+                        for (int i = 1; i < n_Electrons; i++)
+                        {
+                            W_4(a,i)(e/2+Speed_Occ,m/2) = Part1_MPI[K][index_counter];
+                            i++;
+                            index_counter += 1;
+                        }
+                        e++;
+                    }
+                }
+                m++;
+            }
+            a++;
         }
     }
 }
 
 void CCSD_Memory_optimized::Fill_F1()
 {
+    // Initialize F1, F2 and F3
     D1 = FS_AI;
+    D2 = FS_IJ;
+    D3 = FS_AB;
 
-    int A,M;
-    M = 0;
-    for (int m = 0; m < n_Electrons; m++)
-    {
-        A=0;
-        for (int a = 0; a < unocc_orb; a++)
-        {
-            D1.at(A,M) += accu(integ2.at(a,m) % T_1);
-            a++;
-            A++;
-        }
-        m++;
-        M++;
-    }
+    // Also initialize T_1_new here, since it will be easier
+    T_1_new = FS_AI;
 
-    M=0;
-    for (int m = 1; m < n_Electrons; m++)
-    {
-        A=0;
-        for (int a = 1; a < unocc_orb; a++)
-        {
-            D1.at(A+Speed_Occ,M) += accu(integ2.at(a,m) % T_1);
-            a++;
-            A++;
-        }
-        m++;
-        M++;
-    }
+    // Run F1 in parallel in the W_1_and_W_3 function :O
 }
 
 void CCSD_Memory_optimized::Fill_F2()
 {
     int I,M;
-    int sped;
-    M = 0;
-    D2 = FS_IJ;
 
+    // Do most of F2 in parallel, except for n^3 terms
+
+    M = 0;
     for (int m = 0; m < n_Electrons; m++)
     {
         I = 0;
         for (int i = 0; i < n_Electrons; i++)
         {
             D2.at(M,I) += accu(D1(span(0, Speed_Occ-1), m/2) % T_1(span(0, Speed_Occ-1), i/2));
-
-            for (int e = 0; e < unocc_orb; e++)
-            {
-                D2.at(M,I) += 0.5*accu(integ2.at(e,m) % t2.at(e,i));
-            }
-
-            for (int k = 0; k < n_Electrons; k++)
-            {
-                sped = k%2;
-                D2.at(M,I) -= accu(integ6.at(m,k)(span(sped*Speed_Occ, sped * Speed_Occ + Speed_Occ-1), i/2) % T_1(span(sped*Speed_Occ, sped*Speed_Occ+Speed_Occ-1), k/2));
-            }
             i++;
             I++;
         }
@@ -825,15 +1463,6 @@ void CCSD_Memory_optimized::Fill_F2()
         for (int i = 1; i < n_Electrons; i++)
         {
             D2.at(M+Speed_Elec,I) += accu(D1(span(Speed_Occ, unocc_orb-1), m/2) % T_1(span(Speed_Occ, unocc_orb-1), i/2));
-            for (int e = 0; e < unocc_orb; e++)
-            {
-                D2.at(M+Speed_Elec,I) += 0.5*accu(integ2.at(e,m) % t2.at(e,i));
-            }
-            for (int k = 0; k < n_Electrons; k++)
-            {
-                sped = k%2;
-                D2.at(M,I) -= accu(integ6.at(m,k)(span(sped*Speed_Occ, sped * Speed_Occ + Speed_Occ-1), i/2) % T_1(span(sped*Speed_Occ, sped*Speed_Occ+Speed_Occ-1), k/2));
-            }
             i++;
             I++;
         }
@@ -844,9 +1473,20 @@ void CCSD_Memory_optimized::Fill_F2()
 
 void CCSD_Memory_optimized::Fill_F3()
 {
-    // Sleng på en if (m - e % 2 == 0) her, kan skippe noen kalkulasjoner når du tensor contracter ut leddene
+    // F3 , or D3 as it is called in program, is VERY SPECIAL VARIABLE
+    // this is extremely important feature described here
+    // D3 is the only variable that is NOT stored as "compact storage"
+    // It is simply compacted together without any flipping of indexes, just removed all zeroes simply
+    // The reason we do not need to do anything special in terms of indexes here is that
+    // this variable is ONLY CALLED AS .row, IN OTHER WORDS ONLY ROWS OF F3
+    // This means we do not need to flip indexes, and you will see in T2 function that
+    // indeed F3 is called as a function of (a) and not (a/2+a%2*Speed_Occ) as is the compact storage way
+    // This is extremely important because you may think this is a bug, but its not
+    // This is actually faster in this implementation because we can simply call index a or b, and not have the division of 2
 
-    D3 = FS_AB;
+
+    // Most of F3 is done in parallel, except for n^3 terms
+
     int E;
     for (int a = 0; a < unocc_orb; a++)
     {
@@ -854,20 +1494,6 @@ void CCSD_Memory_optimized::Fill_F3()
         for (int e = 0; e < unocc_orb; e++)
         {
             D3.at(a,E) -= accu(D1.row(e/2) % T_1.row(a/2));
-
-            for (int m = 1; m < n_Electrons; m++)
-            {
-                D3.at(a,E) += accu(integ5.at(a,m)(e/2, span()) % T_1(span(Speed_Occ, unocc_orb-1), m/2).t());
-                D3.at(a,E) -= 0.5*accu(integ2.at(e,m)(span(Speed_Occ, unocc_orb-1), span()) % t2.at(a,m)(span(Speed_Occ, unocc_orb-1), span()));
-                m++;
-            }
-
-            for (int m = 0; m < n_Electrons; m++)
-            {
-                D3.at(a,E) += accu(integ5.at(a,m)(e/2, span()) % T_1(span(0, Speed_Occ-1), m/2).t());
-                D3.at(a,E) -= 0.5*accu(integ2.at(e,m) % t2.at(a,m));
-                m++;
-            }
             e++;
             E++;
         }
@@ -880,20 +1506,6 @@ void CCSD_Memory_optimized::Fill_F3()
         for (int e = 1; e < unocc_orb; e++)
         {
             D3.at(a,E) -= accu(D1.row(e/2+Speed_Occ) % T_1.row(a/2+Speed_Occ));
-
-            for (int m = 1; m < n_Electrons; m++)
-            {
-                D3.at(a,E) += accu(integ5.at(a,m)(e/2+Speed_Occ, span()) % T_1(span(Speed_Occ, unocc_orb-1), m/2).t());
-                D3.at(a,E) -= 0.5*accu(integ2.at(e,m) % t2.at(a,m));
-                m++;
-            }
-
-            for (int m = 0; m < n_Electrons; m++)
-            {
-                D3.at(a,E) += accu(integ5.at(a,m)(e/2+Speed_Occ, span()) % T_1(span(0, Speed_Occ-1), m/2).t());
-                D3.at(a,E) -= 0.5*accu(integ2.at(e,m)(span(0,Speed_Occ-1), span()) % t2.at(a,m)(span(0,Speed_Occ-1), span()));
-                m++;
-            }
             e++;
             E++;
         }
@@ -903,507 +1515,4822 @@ void CCSD_Memory_optimized::Fill_F3()
 
 void CCSD_Memory_optimized::Fill_tau()
 {
-    for (int a = 0; a < unocc_orb; a++)
+    int A, B, I, J;
+    I = 0;
+    for (int i = 0; i < n_Electrons; i++)
     {
-        for (int b = a+1; b < unocc_orb; b++)
+        J = I+1;
+        for (int j = i+2; j < n_Electrons; j++)
         {
-            if ((a+b)%2 == 1)
+            A = 0;
+            for (int a = 0; a < unocc_orb; a++)
             {
-                for (int i = 0; i < n_Electrons; i++)
+                B = A+1;
+                for (int b = a+2; b < unocc_orb; b++)
                 {
-                    for (int j = 1; j < n_Electrons; j++)
-                    {
-                        tau4(a,b)(i/2,j/2) = t2.at(a,i)(b/2+b%2*Speed_Occ,j/2);
-                        if ((a+i)%2 == 0 && (b+j)%2 == 0)
-                        {
-                            tau4(a,b)(i/2,j/2) += T_1(a/2+a%2*Speed_Occ, i/2) * T_1(b/2+b%2*Speed_Occ, j/2);
-                        }
-
-                        if ((a+j)%2 ==0 && (b+i)%2 == 0)
-                        {
-                            tau4(a,b)(i/2,j/2) -= T_1(a/2+a%2*Speed_Occ, j/2) * T_1(b/2+b%2*Speed_Occ, i/2);
-                        }
-                        j++;
-                    }
-                    i++;
+                    tau3(i,j)(A,B) = t2.at(a,i)(B,J)
+                            + T_1(A, I) * T_1(B, J)
+                            - T_1(A, J) * T_1(B, I);
+                    tau3(i,j)(B,A) = -tau3(i,j)(A,B);
+                    b++;
+                    B++;
                 }
-
-                for (int i = 1; i < n_Electrons; i++)
-                {
-                    for (int j = 0; j < n_Electrons; j++)
-                    {
-                        tau4(a,b)(i/2+Speed_Elec,j/2) = t2.at(a,i)(b/2+b%2*Speed_Occ,j/2);
-                        if ((a+i)%2 == 0 && (b+j)%2 == 0)
-                        {
-                            tau4(a,b)(i/2+Speed_Elec,j/2) += T_1(a/2+a%2*Speed_Occ, i/2) * T_1(b/2+b%2*Speed_Occ, j/2);
-                        }
-
-                        if ((a+j)%2 ==0 && (b+i)%2 == 0)
-                        {
-                            tau4(a,b)(i/2+Speed_Elec,j/2) -= T_1(a/2+a%2*Speed_Occ, j/2) * T_1(b/2+b%2*Speed_Occ, i/2);
-                        }
-                        j++;
-                    }
-                    i++;
-                }
+                a++;
+                A++;
             }
 
-            else
+            A = 0;
+            for (int a = 1; a < unocc_orb; a++)
             {
-                for (int i = 0; i < n_Electrons; i++)
+                B = A+1;
+                for (int b = a+2; b < unocc_orb; b++)
                 {
-                    for (int j = 0; j < n_Electrons; j++)
-                    {
-                        tau4(a,b)(i/2, j/2) = t2.at(a,i)(b/2+b%2*Speed_Occ,j/2);
-                        if ((a+i)%2 == 0 && (b+j)%2 == 0)
-                        {
-                            tau4(a,b)(i/2,j/2) += T_1(a/2+a%2*Speed_Occ, i/2) * T_1(b/2+b%2*Speed_Occ, j/2);
-                        }
-
-                        if ((a+j)%2 ==0 && (b+i)%2 == 0)
-                        {
-                            tau4(a,b)(i/2,j/2) -= T_1(a/2+a%2*Speed_Occ, j/2) * T_1(b/2+b%2*Speed_Occ, i/2);
-                        }
-                        j++;
-                    }
-                    i++;
+                    tau3(i,j)(A+Speed_Occ,B) = t2.at(a,i)(B+Speed_Occ, J);
+                    tau3(i,j)(B+Speed_Occ,A) = -tau3(i,j)(A+Speed_Occ, B);
+                    b++;
+                    B++;
                 }
-
-                for (int i = 1; i < n_Electrons; i++)
-                {
-                    for (int j = 1; j < n_Electrons; j++)
-                    {
-                        tau4(a,b)(i/2+Speed_Elec,j/2) = t2.at(a,i)(b/2+b%2*Speed_Occ,j/2);
-
-                        if ((a+i)%2 == 0 && (b+j)%2 == 0)
-                        {
-                            tau4(a,b)(i/2+Speed_Elec,j/2) += T_1(a/2+a%2*Speed_Occ, i/2) * T_1(b/2+b%2*Speed_Occ, j/2);
-                        }
-
-                        if ((a+j)%2 ==0 && (b+i)%2 == 0)
-                        {
-                            tau4(a,b)(i/2+Speed_Elec,j/2) -= T_1(a/2+a%2*Speed_Occ, j/2) * T_1(b/2+b%2*Speed_Occ, i/2);
-                        }
-                        j++;
-                    }
-                    i++;
-                }
+                a++;
+                A++;
             }
+            j++;
+            J++;
         }
+        i++;
+        I++;
+    }
+
+    I = 0;
+    for (int i = 1; i < n_Electrons; i++)
+    {
+        J = I+1;
+        for (int j = i+2; j < n_Electrons; j++)
+        {
+            A = 0;
+            for (int a = 0; a < unocc_orb; a++)
+            {
+                B = A+1;
+                for (int b = a+2; b < unocc_orb; b++)
+                {
+                    tau3(i,j)(A,B) = t2.at(a,i)(B,J);
+                    tau3(i,j)(B,A) = -tau3(i,j)(A,B);
+                    b++;
+                    B++;
+                }
+                a++;
+                A++;
+            }
+
+            A = 0;
+            for (int a = 1; a < unocc_orb; a++)
+            {
+                B = A+1;
+                for (int b = a+2; b < unocc_orb; b++)
+                {
+                    tau3(i,j)(A+Speed_Occ,B) = t2.at(a,i)(B+Speed_Occ,J)
+                            + T_1(A+Speed_Occ, I) * T_1(B+Speed_Occ, J)
+                            - T_1(A+Speed_Occ, J) * T_1(B+Speed_Occ, I);
+                    tau3(i,j)(B+Speed_Occ,A) = -tau3(i,j)(A+Speed_Occ,B);
+                    b++;
+                    B++;
+                }
+                a++;
+                A++;
+            }
+            J++;
+            j++;
+        }
+        I++;
+        i++;
+    }
+
+    I = 0;
+    for (int i = 0; i < n_Electrons; i++)
+    {
+        J = I;
+        for (int j = i+1; j < n_Electrons; j++)
+        {
+            A = 0;
+            for (int a = 0; a < unocc_orb; a++)
+            {
+                B = A;
+                for (int b = a+1; b < unocc_orb; b++)
+                {
+                    tau3(i,j)(A, B) = t2.at(a,i)(B+Speed_Occ,J)
+                            + T_1(A, I) * T_1(B+Speed_Occ, J);
+                    tau3(i,j)(B+Speed_Occ,A) = -tau3(i,j)(A,B);
+                    b++;
+                    B++;
+                }
+                a++;
+                A++;
+            }
+
+            A = 0;
+            for (int a = 1; a < unocc_orb; a++)
+            {
+                B = A+1;
+                for (int b = a+1; b < unocc_orb; b++)
+                {
+                    tau3(i,j)(A+Speed_Occ,B) = t2.at(a,i)(B,J)
+                            - T_1(A+Speed_Occ, J) * T_1(B, I);
+                    tau3(i,j)(B,A) = -tau3(i,j)(A+Speed_Occ,B);
+                    b++;
+                    B++;
+                }
+                a++;
+                A++;
+            }
+            J++;
+            j++;
+        }
+        i++;
+        I++;
+    }
+
+    I = 0;
+    for (int i = 1; i < n_Electrons; i++)
+    {
+        J = I+1;
+        for (int j = i+1; j< n_Electrons; j++)
+        {
+            A = 0;
+            for (int a = 0; a < unocc_orb; a++)
+            {
+                B = A;
+                for (int b = a+1; b < unocc_orb; b++)
+                {
+                    tau3(i,j)(A,B) = t2.at(a,i)(B+Speed_Occ,J)
+                            - T_1(A, J) * T_1(B+Speed_Occ, I);
+                    tau3(i,j)(B+Speed_Occ,A) = -tau3(i,j)(A,B);
+                    b++;
+                    B++;
+                }
+                a++;
+                A++;
+            }
+
+            A = 0;
+            for (int a = 1; a < unocc_orb; a++)
+            {
+                B = A+1;
+                for (int b = a+1; b < unocc_orb; b++)
+                {
+                    tau3(i,j)(A+Speed_Occ,B) = t2.at(a,i)(B,J)
+                            + T_1(A+Speed_Occ, I) * T_1(B, J);
+                    tau3(i,j)(B,A) = -tau3(i,j)(A+Speed_Occ,B);
+                    b++;
+                    B++;
+                }
+                a++;
+                A++;
+            }
+            J++;
+            j++;
+        }
+        i++;
+        I++;
     }
 }
 
-void CCSD_Memory_optimized::Fill_2D_tau(int i, int j)
+void CCSD_Memory_optimized::Fill_2D_tau(int a, int b)
 {
-    if ((i+j)%2 == 1)
+    // 2D mapping of tau so we dont need double storage, implemented soon and will be used in the Fill_t2_new() function
+
+    int A = a/2;
+    int B = b/2;
+    int I,J;
+
+    if (a%2 == 0 && b%2 == 0)
     {
-        for (int a = 0; a < unocc_orb; a++)
+        I = 0;
+        for (int i = 0; i < n_Electrons; i++)
         {
-            for (int b = 1; b < unocc_orb; b++)
+            J = I+1;
+            for (int j = i+2; j < n_Electrons; j++)
             {
-                //tau1(a/2, b/2) = tau4(a,b)(i/2+i%2*Speed_Elec,j/2);
-                tau1(a/2,b/2) = t2.at(a,i)(b/2+b%2*Speed_Occ,j/2);
-
-                if ((a+i)%2 == 0 && (b+j)%2 == 0)
-                {
-                    tau1(a/2,b/2) += T_1(a/2+a%2*Speed_Occ, i/2) * T_1(b/2+b%2*Speed_Occ, j/2);
-                }
-
-                if ((a+j)%2 ==0 && (b+i)%2 == 0)
-                {
-                    tau1(a/2,b/2) -= T_1(a/2+a%2*Speed_Occ, j/2) * T_1(b/2+b%2*Speed_Occ, i/2);
-                }
-                b++;
+                tau1(I, J) = tau3(i,j)(A,B);
+                tau1(J, I) = -tau1(I,J);
+                j++;
+                J++;
             }
-            a++;
+            i++;
+            I++;
         }
 
-        for (int a = 1; a < unocc_orb; a++)
+        I = 0;
+        for (int i = 1; i < n_Electrons; i++)
         {
-            for (int b = 0; b < unocc_orb; b++)
+            J = I+1;
+            for (int j = i+2; j < n_Electrons; j++)
             {
-                tau1(a/2+Speed_Occ,b/2) = t2.at(a,i)(b/2+b%2*Speed_Occ,j/2);
-
-                if ((a+i)%2 == 0 && (b+j)%2 == 0)
-                {
-                    tau1(a/2+Speed_Occ,b/2) += T_1(a/2+a%2*Speed_Occ, i/2) * T_1(b/2+b%2*Speed_Occ, j/2);
-                }
-
-                if ((a+j)%2 ==0 && (b+i)%2 == 0)
-                {
-                    tau1(a/2+Speed_Occ,b/2) -= T_1(a/2+a%2*Speed_Occ, j/2) * T_1(b/2+b%2*Speed_Occ, i/2);
-                }
-                b++;
+                tau1(I+Speed_Elec, J) = 0; //tau3(i,j)(a/2, b/2);
+                tau1(J+Speed_Elec, I) = 0; //-tau1(i/2+Speed_Elec,j/2);
+                j++;
+                J++;
             }
-            a++;
+            i++;
+            I++;
+        }
+    }
+
+    else if (a%2 == 0 && b%2 == 1)
+    {
+        I = 0;
+        for (int i = 0; i < n_Electrons; i++)
+        {
+            J = I;
+            for (int j = i+1; j < n_Electrons; j++)
+            {
+                tau1(I, J) = tau3(i,j)(A,B);
+                tau1(J+Speed_Elec,i/2) = -tau1(I,J);
+                j++;
+                J++;
+            }
+            i++;
+            I++;
+        }
+
+        I = 0;
+        for (int i = 1; i < n_Electrons; i++)
+        {
+            J = I+1;
+            for (int j = i+1; j < n_Electrons; j++)
+            {
+                tau1(I+Speed_Elec, J) = tau3(i,j)(A, B);
+                tau1(J,I) = -tau1(I+Speed_Elec, J);
+                j++;
+                J++;
+            }
+            i++;
+            I++;
+        }
+    }
+
+    else if (a%2 == 1 && b%2 == 0)
+    {
+        I = 0;
+        for (int i = 0; i < n_Electrons; i++)
+        {
+            J = I;
+            for (int j = i+1; j < n_Electrons; j++)
+            {
+                tau1(I, J) = tau3(i,j)(A+Speed_Occ,B);
+                tau1(J+Speed_Elec,I) = -tau1(I,J);
+                j++;
+                J++;
+            }
+            i++;
+            I++;
+        }
+
+        I = 0;
+        for (int i = 1; i < n_Electrons; i++)
+        {
+            J = I+1;
+            for (int j = i+1; j < n_Electrons; j++)
+            {
+                tau1(I+Speed_Elec, J) = tau3(i,j)(A+Speed_Occ, B);
+                tau1(J,I) = -tau1(I+Speed_Elec,J);
+                j++;
+                J++;
+            }
+            i++;
+            I++;
         }
     }
 
     else
     {
-        for (int a = 0; a < unocc_orb; a++)
+        I = 0;
+        for (int i = 0; i < n_Electrons; i++)
         {
-            for (int b = 0; b < unocc_orb; b++)
+            J = I+1;
+            for (int j = i+2; j < n_Electrons; j++)
             {
-                tau1(a/2,b/2) = t2.at(a,i)(b/2+b%2*Speed_Occ,j/2);
-
-                if ((a+i)%2 == 0 && (b+j)%2 == 0)
-                {
-                    tau1(a/2,b/2) += T_1(a/2+a%2*Speed_Occ, i/2) * T_1(b/2+b%2*Speed_Occ, j/2);
-                }
-
-                if ((a+j)%2 ==0 && (b+i)%2 == 0)
-                {
-                    tau1(a/2,b/2) -= T_1(a/2+a%2*Speed_Occ, j/2) * T_1(b/2+b%2*Speed_Occ, i/2);
-                }
-                b++;
+                tau1(I, J) = tau3(i,j)(A+Speed_Occ,B);
+                tau1(J, I) = -tau1(I,J);
+                j++;
+                J++;
             }
-            a++;
+            i++;
+            I++;
         }
 
-        for (int a = 1; a < unocc_orb; a++)
+        I = 0;
+        for (int i = 1; i < n_Electrons; i++)
         {
-            for (int b = 1; b < unocc_orb; b++)
+            J = I+1;
+            for (int j = i+2; j < n_Electrons; j++)
             {
-                tau1(a/2+Speed_Occ,b/2) = t2.at(a,i)(b/2+b%2*Speed_Occ,j/2);
-
-                if ((a+i)%2 == 0 && (b+j)%2 == 0)
-                {
-                    tau1(a/2+Speed_Occ,b/2) += T_1(a/2+a%2*Speed_Occ, i/2) * T_1(b/2+b%2*Speed_Occ, j/2);
-                }
-
-                if ((a+j)%2 ==0 && (b+i)%2 == 0)
-                {
-                    tau1(a/2+Speed_Occ,b/2) -= T_1(a/2+a%2*Speed_Occ, j/2) * T_1(b/2+b%2*Speed_Occ, i/2);
-                }
-
-                b++;
+                tau1(I+Speed_Elec, J) = tau3(i,j)(A+Speed_Occ, B);
+                tau1(J+Speed_Elec, I) = -tau1(I+Speed_Elec,J);
+                j++;
+                J++;
             }
-            a++;
+            i++;
+            I++;
         }
     }
 }
 
 void CCSD_Memory_optimized::Fill_t1_new()
 {
-    // Optimal version of T1 amplitudes:
-    int A=0, I;
-    double temp;
-
-    // f_ai
-    T_1_new = FS_AI;
-
-    // Both even numbers != 0
-    for (int a = 0; a < unocc_orb; a++)
-    {
-        I = 0;
-        for (int i = 0; i < n_Electrons; i++)
-        {
-            // t_ik^ac [F_1]_c^k
-            T_1_new(A,I) += accu(D1 % t2(a,i));
-
-            // - t_k^a [F_2]_i^k
-            T_1_new(A,I) -= accu(D2(span(i%2*Speed_Elec, i%2*Speed_Elec+Speed_Elec-1), i/2) % T_1.row(a/2+a%2*Speed_Occ).t());
-
-            // f_ac t_i^c
-            T_1_new(A,I) += accu(FS_AB(A, span()) % T_1(span(0, Speed_Occ-1), I).t());
-
-            // I_ka^ci t_k^c
-            T_1_new(A,I) -= accu(integ10(a,i) % T_1);
-
-            // 1/2 I_ka^cd tau_ij^cd
-            temp = 0;
-            for (int k = 0; k < i; k++)
-            {
-                Fill_2D_tau(k,i);
-                temp -= accu(integ5.at(a,k) % tau1); // Double calculation here? Rest is in Fill_t2()
-            }
-            T_1_new(A,I) += 0.5*temp;
-
-            // - 1/2 I_kl^ci t_kl^ca - 1/2 I_kl^cd t_kl^ca t_i^d
-            temp = 0;
-            for (int k = 0; k < n_Electrons; k++)
-            {
-                temp += accu(W_3(i,k) % t2(a,k));
-            }
-            T_1_new(A,I) += 0.5*temp;
-
-            i++;
-            I++;
-        }
-        a++;
-        A++;
-    }
-
-    // Both odd numbers also != 0
-    for (int a = 1; a < unocc_orb; a++)
-    {
-        I = 0;
-        for (int i = 1; i < n_Electrons; i++)
-        {
-            // t_ik^ac [F_1]_c^k
-            T_1_new(A,I) += accu(D1 % t2(a,i));
-
-            // - t_k^a [F_2]_i^k
-            T_1_new(A,I) -= accu(D2(span(i%2*Speed_Elec, i%2*Speed_Elec+Speed_Elec-1), i/2) % T_1.row(a/2+a%2*Speed_Occ).t());
-
-            // f_ac t_i^c
-            T_1_new(A,I) += accu(FS_AB(A, span()) % T_1(span(0, Speed_Occ-1), I).t());
-
-            // I_ka^ci t_k^c
-            T_1_new(A,I) -= accu(integ10(a,i) % T_1);
-
-            // 1/2 I_ka^cd tau_ij^cd
-            temp = 0;
-            for (int k = 0; k < i; k++)
-            {
-                Fill_2D_tau(k,i); // Double calculation here? Rest is in Fill_t2()
-                temp -= accu(integ5.at(a,k) % tau1);
-            }
-            T_1_new(A,I) += 0.5*temp;
-
-            // - 1/2 I_kl^ci t_kl^ca - 1/2 I_kl^cd t_kl^ca t_i^d
-            temp = 0;
-            for (int k = 0; k < n_Electrons; k++)
-            {
-                temp += accu(W_3(i,k) % t2(a,k));
-            }
-            T_1_new(A,I) += 0.5*temp;
-
-            i++;
-            I++;
-        }
-        a++;
-        A++;
-    }
+    // This is moved to Fill_t2_new() in parallel implementation :-O
+    // Parts go to Fill_W1_and_W3 due to memory distribution
 }
 
 void CCSD_Memory_optimized::Fill_t2_new()
 {
-    // -0.0501273
+    // Benchmark H2O STO-3G basis set: -0.0501273 au
 
-    // T2 amplitudes calculated here
-    int J;
+    // Optimized Version of T2 calculations
+    // Runs in parallel
+    // THIS IS THE ONLY PLACE MO9 IS ACCESSED - MEMORY SPREAD ON NODES IN a-b GRID
+    // T2-new Stored in an array of size number of nodes times number of calcs for node
+    // This is for communication optimization
+    // Dont store more than one symetric term for communication minimization
+    // Use all symmetries and skip meny calculations where one term will be 0 but the other not or both 0 etc
+    // Try not to skip calculations on terms that are both not 0 :-D
 
-    // One symmetry that holds and can be proven computationally (by printing the numbers) is that
-    // if T2(a,b,i,j) should be not equal to 0 then the following must hold:
-    // if (a - b + i) is an even number then j must also be an even number
-    // if (a - b + i) is an odd number then j must also be an odd number
-    // Everything else is 0. This is implemented here. (a-b+i) = 0 is counted as an even number,
-    // also if (a-b+i) is a negative odd or even number then j must be an odd or even number, but positive
+    int index_counter;
+    int A,B;
+    double temp;
+    int INDEX_CHECK;
+    int work;
 
-    // Also j > i is the only thing worth calculating since symmetry holds. The odd,even thing holds threw symmetry also
+        index_counter = 0;
 
-    // This function is implemented slightly inefficient
-    // However the speedup will all be made up for when program writes new program by itself
-
-    Fill_tau();
-
-    for (int i = 0; i < n_Electrons; i++)
-    {
-        J = (int) (i+1)/2;
-        for (int j = i+1; j < n_Electrons; j++)
+        for (int a = 0; a < unocc_orb; a++) // a even
         {
-            Fill_2D_tau(i,j);
-            Fill_W1(i,j);
-            Fill_W2(i,j);
-            //E_new += accu(tau1 % integ4(i,j));
-            //E_new -= accu(tau1 % integ4(j,i));
-            for (int a = 0; a < unocc_orb; a++)
+            A = a/2;
+            for (int b = a+2; b < unocc_orb; b++) // b even
             {
-                if ((a+i)%2 == 0)
+                B = Speed_Occ - b/2;
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == rank)
                 {
-                    T_1_new(a/2+a%2*Speed_Occ, i/2) += 0.5*accu(integ5.at(a,j) % tau1); // One part of T1 calculated here because tau1 is stored 2D
-                }
-                for (int b = a+1; b < unocc_orb; b++)
-                {
-                    if ((a+i+b+j)%2 == 0)
+                    Fill_integ3_2D(a, b);
+                    Fill_integ9_2D(a, b);
+                    Fill_2D_tau(a, b);
+
+                    for (int i = 0; i < n_Electrons; i++) // i even
                     {
-                        // I_ab^ij
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) = integ4.at(i,j)(a/2+a%2*Speed_Occ,b/2);
-
-                        // P(ab) P(ij) [W_4] t_jk^bc, ARMADILLO
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(b,j) % W_4.at(a,i));
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(b,i) % W_4.at(a,j));
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(a,j) % W_4.at(b,i));
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,i) % W_4.at(b,j));
-
-                        // - P(ab) [W_2] t_k^b, ARMADILLO
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(W_2(a/2+a%2*Speed_Occ, span()) % T_1.row(b/2+b%2*Speed_Occ));
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(W_2(b/2+b%2*Speed_Occ, span()) % T_1.row(a/2+a%2*Speed_Occ));
-
-                        // 1/2 I_ab^cd tau_ij^cd, ARMADILLO
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += 0.5*accu(integ3.at(a,b) % tau1);
-
-                        // P(ij) I_ab^cj t_i^c, ARMADILLO
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(integ9.at(a,b)(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1), i/2) % T_1(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1), j/2));
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(integ9.at(a,b)(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1), j/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1), i/2));
-
-                        // 1/2 [W_1] tau_kl^ab, ARMADILLO
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += 0.5*accu(W_1 % tau4.at(a,b));
-
-                        // P(ij) t_jk^ab [F_2] + P(ab) t_ij^bc [F_3]_c^a, ARMADILLO
-                        if (a % 2 == 0)
+                        for (int j = i+2; j < n_Electrons; j++) // j even
                         {
-                            if (i % 2 == 0)
-                            {
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,j)((int)b/2+Speed_Occ, span()) % D2.row(i/2));
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(a,i)((int)b/2+Speed_Occ, span()) % D2.row((int)(j/2+Speed_Elec)));
-                            }
+                            // I_ab^ij, hopefully correct
+                            T2_MPI[rank][index_counter] = -MOLeftovers(a/2, b/2)(j/2, i/2) + MOLeftovers(a/2, b/2)(i/2, j/2) // integ2.at(b,j)(a/2,i/2)
 
-                            else
-                            {
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,j)((int)b/2+Speed_Occ, span()) % D2.row((int)i/2+Speed_Elec));
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(a,i)((int)b/2+Speed_Occ, span()) % D2.row((int)j/2));
-                            }
+                            // P(ab) P(ij) [W_4] t_jk^bc, ARMADILLO
+                                    + accu(t2.at(b,j) % W_4.at(a,i))
+                                    - accu(t2.at(b,i) % W_4.at(a,j))
+                                    - accu(t2.at(a,j) % W_4.at(b,i))
+                                    + accu(t2.at(a,i) % W_4.at(b,j))
 
-                            t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(b,i)(span(0, Speed_Occ-1), J) % D3.row(a).t());
-                            t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,i)(span(Speed_Occ, unocc_orb-1), J) % D3.row(b).t());
+                            // - P(ab) [] t_k^b, ARMADILLO
+                                    - accu(W_2(i,j)(a/2, span()) % T_1.row(b/2))
+                                    + accu(W_2(i,j)(b/2, span()) % T_1.row(a/2))
+
+                            // 1/2 [W_1] tau_kl^ab, ARMADILLO
+                                    + 0.5*accu(W_1(i,j)(span(0, Speed_Elec-1), span()) % tau1(span(0, Speed_Elec-1), span())) // Half matrix = 0, skip this
+
+                            // P(ij) t_jk^ab [F_2] + P(ab) t_ij^bc [F_3]_c^a, ARMADILLO
+                                    - accu(t2.at(b,i)(span(0, Speed_Occ-1), j/2) % D3.row(a).t()) // Notice a is called, and not a/2+a%2*Speed_Occ
+                                    + accu(t2.at(a,i)(span(0, Speed_Occ-1), j/2) % D3.row(b).t()) // This is because it is a special variable, descibed in Fill_F3 function
+
+                                    + accu(t2.at(a,j)(b/2, span()) % D2.row(i/2))
+                                    - accu(t2.at(a,i)(b/2, span()) % D2.row(j/2))
+
+                            // P(ij) I_ab^cj t_i^c, ARMADILLO
+                                    - accu(integ9_2D(span(0, Speed_Occ-1), i/2) % T_1(span(0, Speed_Occ-1), j/2))
+                                    + accu(integ9_2D(span(0, Speed_Occ-1), j/2) % T_1(span(0, Speed_Occ-1), i/2))
+
+                            // 0.5 I_ab^cd tau
+                                    + 0.5*accu(integ3_2D(span(0, Speed_Occ-1), span()) % tau3(i,j)(span(0, Speed_Occ-1), span())); // Half matrix = 0, skip this
+
+
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+
+                /* // Forbidden!
+                for (int i = 1; i < n_Electrons; i++) // i odd
+                {
+                    for (int j = i+2; j < n_Electrons; j++) // j odd
+                    {
+                        j++;
+                    }
+                    i++;
+                }
+                */
+
+                }
+                b++;
+            }
+            a++;
+        }
+
+        for (int a = 1; a < unocc_orb; a++) // a odd
+        {
+            A = a/2;
+            for (int b = a+2; b < unocc_orb; b++) // b odd
+            {
+                B = Speed_Occ - b/2;
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == rank)
+                {
+
+                    Fill_integ3_2D(a, b);
+                    Fill_integ9_2D(a, b);
+                    Fill_2D_tau(a, b);
+
+                    for (int i = 0; i < n_Electrons; i++) // i even
+                    {
+                        for (int j = i+2; j < n_Electrons; j++) // j even
+                        {
+                            // I_ab^ij
+                            T2_MPI[rank][index_counter] = 0 // integ2.at(b,j)(a/2+Speed_Occ,i/2)
+
+                            // P(ab) P(ij) [W_4] t_jk^bc, ARMADILLO
+                                    + accu(t2.at(b,j) % W_4.at(a,i))
+                                    - accu(t2.at(b,i) % W_4.at(a,j))
+                                    - accu(t2.at(a,j) % W_4.at(b,i))
+                                    + accu(t2.at(a,i) % W_4.at(b,j))
+
+                            // - P(ab) [] t_k^b, ARMADILLO
+                                    - accu(W_2(i,j)(a/2+Speed_Occ, span()) % T_1.row(b/2+Speed_Occ))
+                                    + accu(W_2(i,j)(b/2+Speed_Occ, span()) % T_1.row(a/2+Speed_Occ))
+
+                            // 1/2 [W_1] tau_kl^ab, ARMADILLO
+                                    + 0.5*accu(W_1(i,j)(span(0, Speed_Elec-1), span()) % tau1(span(0, Speed_Elec-1), span()))
+
+                            // P(ij) t_jk^ab [F_2] + P(ab) t_ij^bc [F_3]_c^a, ARMADILLO
+                                    - accu(t2.at(b,i)(span(0, Speed_Occ-1), j/2) % D3.row(a).t()) // Notice a is called, and not a/2+a%2*Speed_Occ
+                                    + accu(t2.at(a,i)(span(0, Speed_Occ-1), j/2) % D3.row(b).t()) // This is because it is a special variable, descibed in Fill_F3 function
+
+                                    + accu(t2.at(a,j)(b/2+Speed_Occ,span()) % D2.row(i/2))
+                                    - accu(t2.at(a,i)(b/2+Speed_Occ, span()) % D2.row(j/2))
+
+                            // P(ij) I_ab^cj t_i^c, ARMADILLO
+                                    - accu(integ9_2D(span(0, Speed_Occ-1), i/2) % T_1(span(0, Speed_Occ-1), j/2))
+                                    + accu(integ9_2D(span(0, Speed_Occ-1), j/2) % T_1(span(0, Speed_Occ-1), i/2))
+
+                            // 0.5 I_ab^cd tau
+                                    + 0.5*accu(integ3_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()) % tau3(i,j)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span())); // Half matrix = 0, skip this
+
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++) // i odd
+                    {
+                        for (int j = i+2; j < n_Electrons; j++) // j odd
+                        {
+                            // I_ab^ij
+                            T2_MPI[rank][index_counter] = MOLeftovers(a/2, b/2)(i/2, j/2) - MOLeftovers(a/2, b/2)(j/2,i/2) // integ2.at(b,j)(a/2+Speed_Occ,i/2)
+
+                            // P(ab) P(ij) [W_4] t_jk^bc, ARMADILLO
+                                    + accu(t2.at(b,j) % W_4.at(a,i))
+                                    - accu(t2.at(b,i) % W_4.at(a,j))
+                                    - accu(t2.at(a,j) % W_4.at(b,i))
+                                    + accu(t2.at(a,i) % W_4.at(b,j))
+
+                            // - P(ab) [] t_k^b, ARMADILLO
+                                    - accu(W_2(i,j)(a/2+Speed_Occ, span()) % T_1.row(b/2+Speed_Occ))
+                                    + accu(W_2(i,j)(b/2+Speed_Occ, span()) % T_1.row(a/2+Speed_Occ))
+
+                            // 1/2 [W_1] tau_kl^ab, ARMADILLO
+                                    + 0.5*accu(W_1(i,j)(span(Speed_Elec, Speed_Elec+Speed_Elec-1), span()) % tau1(span(Speed_Elec, Speed_Elec+Speed_Elec-1), span()))
+
+                            // P(ij) t_jk^ab [F_2] + P(ab) t_ij^bc [F_3]_c^a, ARMADILLO
+                                    - accu(t2.at(b,i)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), j/2) % D3.row(a).t()) // Notice a is called, and not a/2+a%2*Speed_Occ
+                                    + accu(t2.at(a,i)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), j/2) % D3.row(b).t()) // This is because it is a special variable, descibed in Fill_F3 function
+
+                                    + accu(t2.at(a,j)(b/2+Speed_Occ, span()) % D2.row(i/2+Speed_Elec))
+                                    - accu(t2.at(a,i)(b/2+Speed_Occ, span()) % D2.row(j/2+Speed_Elec))
+
+                            // P(ij) I_ab^cj t_i^c, ARMADILLO
+                                    - accu(integ9_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), i/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), j/2))
+                                    + accu(integ9_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), j/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), i/2))
+
+                            // 0.5 I_ab^cd tau
+                                    + 0.5*accu(integ3_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()) % tau3(i,j)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()));
+
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+
+                }
+                b++;
+            }
+            a++;
+        }
+
+        for (int a = 0; a < unocc_orb; a++) // a even
+        {
+            A = a/2;
+            for (int b = a+1; b < unocc_orb; b++) // b odd
+            {
+                B = Speed_Occ - b/2;
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == rank)
+                {
+                    Fill_integ3_2D(a, b);
+                    Fill_integ9_2D(a, b);
+                    Fill_2D_tau(a, b);
+
+                    for (int i = 0; i < n_Electrons; i++) // i even
+                    {
+                        for (int j = i+1; j < n_Electrons; j++) // j odd
+                        {
+                            // I_ab^ij
+                            T2_MPI[rank][index_counter] = MOLeftovers(a/2, b/2)(i/2, j/2) // integ2.at(b,j)(a/2,i/2)
+
+                            // P(ab) P(ij) [W_4] t_jk^bc, ARMADILLO
+                                    - accu(t2.at(a,j)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()) % W_4.at(b,i)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()))
+                                    - accu(t2.at(b,i)(span(0, Speed_Occ-1), span()) % W_4.at(a,j)(span(0, Speed_Occ-1), span()))
+                                    + accu(t2.at(a,i) % W_4.at(b,j))
+                                    + accu(t2.at(b,j) % W_4.at(a,i))
+
+                            // P(ij) t_jk^ab [F_2] + P(ab) t_ij^bc [F_3]_c^a, ARMADILLO
+                                    - accu(t2.at(b,i)(span(0, Speed_Occ-1), j/2) % D3.row(a).t()) // Notice a is called, and not a/2+a%2*Speed_Occ
+                                    + accu(t2.at(a,i)(span(Speed_Occ, unocc_orb-1), j/2) % D3.row(b).t()) // This is because it is a special variable, descibed in Fill_F3 function
+
+                                    + accu(t2.at(a,j)(b/2+Speed_Occ, span()) % D2.row(i/2))
+                                    - accu(t2.at(a,i)(b/2+Speed_Occ, span()) % D2.row(j/2+Speed_Elec))
+
+                            // 1/2 [W_1] tau_kl^ab, ARMADILLO
+                                    + 0.5*accu(W_1(i,j) % tau1)
+
+                            // - P(ab) [W_2] t_k^b, ARMADILLO
+                                    - accu(W_2(i,j)(a/2, span()) % T_1.row(b/2+Speed_Occ))
+                                    + accu(W_2(i,j)(b/2+Speed_Occ, span()) % T_1.row(a/2))
+
+                            // P(ij) I_ab^cj t_i^c, ARMADILLO
+                                    - accu(integ9_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), i/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), j/2))
+                                    + accu(integ9_2D(span(0, Speed_Occ-1), j/2) % T_1(span(0, Speed_Occ-1), i/2))
+
+                            // 0.5 I_ab^cd tau
+                                    + 0.5*accu(integ3_2D % tau3(i,j));
+
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++) // i odd
+                    {
+                        for (int j = i+1; j < n_Electrons; j++) // j even
+                        {
+                            // I_ab^ij
+                            T2_MPI[rank][index_counter] = -MOLeftovers(a/2, b/2)(j/2, i/2) // integ2.at(b,j)(a/2,i/2)
+
+                            // P(ab) P(ij) [W_4] t_jk^bc, ARMADILLO
+                                    - accu(t2.at(a,j) % W_4.at(b,i))
+                                    - accu(t2.at(b,i) % W_4.at(a,j))
+                                    + accu(t2.at(a,i)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()) % W_4.at(b,j)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()))
+                                    + accu(t2.at(b,j)(span(0, Speed_Occ-1), span()) % W_4.at(a,i)(span(0, Speed_Occ-1), span()))
+
+                            // P(ij) t_jk^ab [F_2] + P(ab) t_ij^bc [F_3]_c^a, ARMADILLO
+                                    - accu(t2.at(b,i)(span(0, Speed_Occ-1), j/2) % D3.row(a).t()) // Notice a is called, and not a/2+a%2*Speed_Occ
+                                    + accu(t2.at(a,i)(span(Speed_Occ, unocc_orb-1), j/2) % D3.row(b).t()) // This is because it is a special variable, descibed in Fill_F3 function
+
+                                    + accu(t2.at(a,j)(b/2+Speed_Occ, span()) % D2.row(i/2+Speed_Elec))
+                                    - accu(t2.at(a,i)(b/2+Speed_Occ, span()) % D2.row(j/2))
+
+                            // 1/2 [W_1] tau_kl^ab, ARMADILLO
+                                    + 0.5*accu(W_1(i,j) % tau1)
+
+                            // - P(ab) [W_2] t_k^b, ARMADILLO
+                                    - accu(W_2(i,j)(a/2, span()) % T_1.row(b/2+Speed_Occ))
+                                    + accu(W_2(i,j)(b/2+Speed_Occ, span()) % T_1.row(a/2))
+
+                            // P(ij) I_ab^cj t_i^c, ARMADILLO
+                                    - accu(integ9_2D(span(0, Speed_Occ-1), i/2) % T_1(span(0, Speed_Occ-1), j/2))
+                                    + accu(integ9_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), j/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), i/2))
+
+                            // 0.5 I_ab^cd tau
+                                    + 0.5*accu(integ3_2D % tau3(i,j));
+
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+                }
+                b++;
+            }
+            a++;
+        }
+
+        for (int a = 1; a < unocc_orb; a++) // a odd
+        {
+            A = a/2;
+            for (int b = a+1; b < unocc_orb; b++) // b even
+            {
+                B = Speed_Occ - b/2;
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == rank)
+                {
+                    Fill_integ3_2D(a, b);
+                    Fill_integ9_2D(a, b);
+                    Fill_2D_tau(a, b);
+
+                    for (int i = 0; i < n_Electrons; i++) // i even
+                    {
+                        for (int j = i+1; j < n_Electrons; j++) // j odd
+                        {
+                            // I_ab^ij
+                            T2_MPI[rank][index_counter] = -MOLeftovers(a/2, b/2)(j/2, i/2) // integ2.at(b,j)(a/2+Speed_Occ,i/2)
+
+                            // P(ab) P(ij) [W_4] t_jk^bc, ARMADILLO
+                                    - accu(t2.at(a,j) % W_4.at(b,i))
+                                    - accu(t2.at(b,i) % W_4.at(a,j))
+                                    + accu(t2.at(a,i)(span(0, Speed_Occ-1), span()) % W_4.at(b,j)(span(0, Speed_Occ-1), span()))
+                                    + accu(t2.at(b,j)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()) % W_4.at(a,i)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()))
+
+                            // P(ij) t_jk^ab [F_2] + P(ab) t_ij^bc [F_3]_c^a, ARMADILLO
+                                    + accu(t2.at(a,j)(b/2,span()) % D2.row(i/2))
+                                    - accu(t2.at(a,i)(b/2,span()) % D2.row(j/2+Speed_Elec))
+
+                                    - accu(t2.at(b,i)(span(Speed_Occ, unocc_orb-1), j/2) % D3.row(a).t()) // Notice a is called, and not a/2+a%2*Speed_Occ
+                                    + accu(t2.at(a,i)(span(0, Speed_Occ-1), j/2) % D3.row(b).t()) // This is because it is a special variable, descibed in Fill_F3 function
+
+                            // 1/2 [W_1] tau_kl^ab, ARMADILLO
+                                    + 0.5*accu(W_1(i,j) % tau1)
+
+                            // - P(ab) [W_2] t_k^b, ARMADILLO
+                                    - accu(W_2(i,j)(a/2+Speed_Occ, span()) % T_1.row(b/2))
+                                    + accu(W_2(i,j)(b/2, span()) % T_1.row(a/2+Speed_Occ))
+
+                            // P(ij) I_ab^cj t_i^c, ARMADILLO
+                                    - accu(integ9_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), i/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), j/2))
+                                    + accu(integ9_2D(span(0, Speed_Occ-1), j/2) % T_1(span(0, Speed_Occ-1), i/2))
+
+                            // 0.5 I_ab^cd tau
+                                    + 0.5*accu(integ3_2D % tau3(i,j));
+
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++) // i odd
+                    {
+                        for (int j = i+1; j < n_Electrons; j++) // j even
+                        {
+                            // I_ab^ij
+                            T2_MPI[rank][index_counter] = MOLeftovers(a/2, b/2)(i/2, j/2) // integ2.at(b,j)(a/2+Speed_Occ,i/2)
+
+                            // P(ab) P(ij) [W_4] t_jk^bc, ARMADILLO
+                                    - accu(t2.at(a,j)(span(0, Speed_Occ-1), span()) % W_4.at(b,i)(span(0, Speed_Occ-1), span()))
+                                    - accu(t2.at(b,i)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()) % W_4.at(a,j)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()))
+                                    + accu(t2.at(a,i) % W_4.at(b,j))
+                                    + accu(t2.at(b,j) % W_4.at(a,i))
+
+                            // P(ij) t_jk^ab [F_2] + P(ab) t_ij^bc [F_3]_c^a, ARMADILLO
+                                    + accu(t2.at(a,j)(b/2, span()) % D2.row(i/2+Speed_Elec))
+                                    - accu(t2.at(a,i)(b/2, span()) % D2.row(j/2))
+
+                                    - accu(t2.at(b,i)(span(Speed_Occ, unocc_orb-1), j/2) % D3.row(a).t()) // Notice a is called, and not a/2+a%2*Speed_Occ
+                                    + accu(t2.at(a,i)(span(0, Speed_Occ-1), j/2) % D3.row(b).t()) // This is because it is a special variable, descibed in Fill_F3 function
+
+                            // 1/2 [W_1] tau_kl^ab, ARMADILLO
+                                    + 0.5*accu(W_1(i,j) % tau1)
+
+                            // - P(ab) [W_2] t_k^b, ARMADILLO
+                                    - accu(W_2(i,j)(a/2+Speed_Occ, span()) % T_1.row(b/2))
+                                    + accu(W_2(i,j)(b/2, span()) % T_1.row(a/2+Speed_Occ))
+
+                            // P(ij) I_ab^cj t_i^c, ARMADILLO
+                                    - accu(integ9_2D(span(0, Speed_Occ-1), i/2) % T_1(span(0, Speed_Occ-1), j/2))
+                                    + accu(integ9_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), j/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1), i/2))
+
+                            // 0.5 I_ab^cd tau
+                                    + 0.5*accu(integ3_2D % tau3(i,j));
+
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+                }
+                b++;
+            }
+            a++;
+        }
+
+        for (int a = 0; a < unocc_orb; a++)
+        {
+            for (int i = 0; i < n_Electrons; i++)
+            {
+                INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - i/2;
+                if (INDEX_CHECK % size == rank)
+                {
+                    Fill_integ10_2D(a, i);
+
+                    // - 1/2 I_kl^ci t_kl^ca - 1/2 I_kl^cd t_kl^ca t_i^d
+                    temp = 0;
+                    for (int k = 0; k < n_Electrons; k++)
+                    {
+                        if (k%2 == 1)
+                        {
+                            temp += accu(W_3(i,k) % t2(a,k)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()));
                         }
 
                         else
                         {
-                            if (i % 2 == 0)
-                            {
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,j)(b/2,span()) % D2.row(i/2));
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(a,i)((int)b/2, span()) % D2.row(j/2+Speed_Elec));
-                            }
+                            temp += accu(W_3(i,k) % t2(a,k));
 
-                            else
-                            {
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,j)((int)b/2, span()) % D2.row(i/2+Speed_Elec));
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(a,i)((int)b/2, span()) % D2.row(j/2));
-                            }
-
-                            t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(b,i)(span(Speed_Occ, unocc_orb-1), J) % D3.row(a).t());
-                            t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,i)(span(0, Speed_Occ-1), J) % D3.row(b).t());
                         }
-
-                        // Symmetries
-                        t2_new(b,i)(a/2+a%2*Speed_Occ, j/2) = -t2_new(a,i)(b/2+b%2*Speed_Occ, j/2);
-                        t2_new(a,j)(b/2+b%2*Speed_Occ, i/2) = t2_new(b,i)(a/2+a%2*Speed_Occ, j/2);
-                        t2_new(b,j)(a/2+a%2*Speed_Occ, i/2) = t2_new(a,i)(b/2+b%2*Speed_Occ, j/2);
                     }
 
+                    T2_MPI[rank][index_counter] = 0.5*temp
 
-                    b++;
+                            // t_ik^ac [F_1]_c^k
+                            + accu(D1 % t2(a,i))
+
+                            // - t_k^a [F_2]_i^k
+                            - accu(D2(span(i%2*Speed_Elec, i%2*Speed_Elec+Speed_Elec-1), i/2) % T_1.row(a/2+a%2*Speed_Occ).t())
+
+                            // f_ac t_i^c
+                            + accu(FS_AB(a/2, span()) % T_1(span(0, Speed_Occ-1), i/2).t())
+
+                            // I_ka^ci t_k^c
+                            - accu(integ10_2D % T_1);
+                    index_counter += 1;
                 }
+
+                i++;
             }
-            j++;
-            J++;
+            a++;
         }
-    }
 
-    for (int i = 0; i < n_Electrons; i++)
-    {
-        J = (int) (i/2);
-        J++;
-        for (int j = i+2; j < n_Electrons; j++)
+        for (int a = 1; a < unocc_orb; a++)
         {
-            Fill_2D_tau(i,j);
-            Fill_W1(i,j);
-            Fill_W2(i,j);
-            E_new += accu(tau1 % integ4(i,j));
-            E_new -= accu(tau1 % integ4(j,i));
-            for (int a = 0; a < unocc_orb; a++)
+            for (int i = 1; i < n_Electrons; i++)
             {
-                if ((a+i)%2 == 0)
+                INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - i/2;
+                if (INDEX_CHECK % size == rank)
                 {
-                    T_1_new(a/2+a%2*Speed_Occ, i/2) += 0.5*accu(integ5.at(a,j) % tau1); // One part of T1 calculated here because tau1 is stored 2D
-                }
+                    Fill_integ10_2D(a, i);
 
-                for (int b = a+2; b < unocc_orb; b++)
-                {
-                    if (a%2 != 0 || b%2 != 0 || i%2 != 1 || j%2 != 1)
+                    // - 1/2 I_kl^ci t_kl^ca - 1/2 I_kl^cd t_kl^ca t_i^d
+                    temp = 0;
+                    for (int k = 0; k < n_Electrons; k++)
                     {
-                    if ((a+i+b+j)%2 == 0)
-                    {
-                        // I_ab^ij
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) = integ4.at(i,j)(a/2+a%2*Speed_Occ,b/2);
-
-                        // P(ab) P(ij) [W_4] t_jk^bc, ARMADILLO
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(b,j) % W_4.at(a,i));
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(b,i) % W_4.at(a,j));
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(a,j) % W_4.at(b,i));
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,i) % W_4.at(b,j));
-
-                        // - P(ab) [] t_k^b, ARMADILLO
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(W_2(a/2+a%2*Speed_Occ, span()) % T_1.row(b/2+b%2*Speed_Occ));
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(W_2(b/2+b%2*Speed_Occ, span()) % T_1.row(a/2+a%2*Speed_Occ));
-
-                        // 1/2 I_ab^cd tau_ij^cd, ARMADILLO
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += 0.5*accu(integ3.at(a,b) % tau1);
-
-                        // P(ij) I_ab^cj t_i^c, ARMADILLO
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(integ9.at(a,b)(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1), i/2) % T_1(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1), j/2));
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(integ9.at(a,b)(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1), j/2) % T_1(span(i%2*Speed_Occ, i%2*Speed_Occ+Speed_Occ-1), i/2));
-
-                        // 1/2 [W_1] tau_kl^ab, ARMADILLO
-                        t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += 0.5*accu(W_1 % tau4.at(a,b));
-
-                        // P(ij) t_jk^ab [F_2] + P(ab) t_ij^bc [F_3]_c^a, ARMADILLO
-                        if (a % 2 == 0)
+                        if (k%2 == 1)
                         {
-                            t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(b,i)(span(0, Speed_Occ-1), J) % D3.row(a).t());
-                            t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,i)(span(0, Speed_Occ-1), J) % D3.row(b).t());
-
-                            if (i % 2 == 0)
-                            {
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,j)((int)b/2, span()) % D2.row(i/2));
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(a,i)((int)b/2, span()) % D2.row(j/2+Speed_Elec));
-                            }
-
-                            else
-                            {
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,j)((int)b/2, span()) % D2.row((int)i/2+Speed_Elec));
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(a,i)((int)b/2, span()) % D2.row(j/2));
-                            }
+                            temp += accu(W_3(i,k) % t2(a,k));
                         }
 
                         else
                         {
-                            t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(b,i)(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1), J) % D3.row(a).t());
-                            t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,i)(span(j%2*Speed_Occ, j%2*Speed_Occ+Speed_Occ-1), J) % D3.row(b).t());
-
-
-                            if (i % 2 == 0)
-                            {
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,j)(b/2+Speed_Occ,span()) % D2.row(i/2));
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(a,i)((int)b/2+Speed_Occ, span()) % D2.row(j/2+Speed_Elec));
-                            }
-
-                            else
-                            {
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) += accu(t2.at(a,j)((int)b/2+Speed_Occ, span()) % D2.row(i/2+Speed_Elec));
-                                t2_new(a,i)(b/2+b%2*Speed_Occ, j/2) -= accu(t2.at(a,i)((int)b/2+Speed_Occ, span()) % D2.row(j/2));
-                            }
-
+                            temp += accu(W_3(i,k) % t2(a,k)(span(0, Speed_Occ-1), span()));
                         }
-
-                        // Symmetries
-                        t2_new(b,i)(a/2+a%2*Speed_Occ, j/2) = -t2_new(a,i)(b/2+b%2*Speed_Occ, j/2);
-                        t2_new(a,j)(b/2+b%2*Speed_Occ, i/2) = t2_new(b,i)(a/2+a%2*Speed_Occ, j/2);
-                        t2_new(b,j)(a/2+a%2*Speed_Occ, i/2) = t2_new(a,i)(b/2+b%2*Speed_Occ, j/2);
-                    }
                     }
 
-                    b++;
+                    T2_MPI[rank][index_counter] = 0.5*temp
+
+                            // t_ik^ac [F_1]_c^k
+                            + accu(D1 % t2(a,i))
+
+                            // - t_k^a [F_2]_i^k
+                            - accu(D2(span(i%2*Speed_Elec, i%2*Speed_Elec+Speed_Elec-1), i/2) % T_1.row(a/2+a%2*Speed_Occ).t())
+
+                            // f_ac t_i^c
+                            + accu(FS_AB(a/2+Speed_Occ, span()) % T_1(span(Speed_Occ, unocc_orb-1), i/2).t())
+
+                            - accu(integ10_2D % T_1);
+                    index_counter += 1;
                 }
+                i++;
             }
-            j++;
-            J++;
+            a++;
         }
-    }
 
-    // Get denominator matrix
-    T_1_new = T_1_new % DEN_AI;
-    for (int a = 0; a < unocc_orb; a++)
+    for (int K = 0; K < size; K++)
     {
-        for (int i = 0; i < n_Electrons; i++)
+        work = WORK_EACH_NODE(K);
+        MPI_Bcast(T2_MPI[K], work, MPI_DOUBLE, K, MPI_COMM_WORLD);
+    }
+}
+
+void CCSD_Memory_optimized::Map_T_new()
+{
+    // Mapping for parallel implementation!
+    // Needs to resemble the CALCULATE T2 FUNCTION EXACTLY!!!!
+    //                       BECAUSE WE NEED TO USE INDEX COUNTER
+    //                      this is to make the transfer extreme easy
+
+    double temp;
+    int A,B, INDEX_CHECK;
+    int index_counter;
+
+    for (int K = 0; K < size; K++)
+    {   // This loop is here in transformation to MPI only
+
+        index_counter = 0;
+
+        for (int a = 0; a < unocc_orb; a++) // a even
         {
-            t2_new(a,i) = t2_new(a,i) % DEN_ABIJ(a,i);
+            A = a/2;
+            for (int b = a+2; b < unocc_orb; b++) // b even
+            {
+                B = Speed_Occ - b/2;
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int i = 0; i < n_Electrons; i++) // i even
+                    {
+                        for (int j = i+2; j < n_Electrons; j++) // j even
+                        {
+                            temp = T2_MPI[K][index_counter] / (DEN_AI(a/2+a%2*Speed_Occ,i/2)+DEN_AI(b/2+b%2*Speed_Occ, j/2));
+
+                            t2(a,i)(b/2+b%2*Speed_Occ, j/2) = temp;
+                            t2(b,i)(a/2+a%2*Speed_Occ, j/2) = -temp;
+                            t2(a,j)(b/2+b%2*Speed_Occ, i/2) = -temp;
+                            t2(b,j)(a/2+a%2*Speed_Occ, i/2) = temp;
+
+                            j++;
+                            index_counter += 1;
+                        }
+                        i++;
+                    }
+                }
+                b++;
+            }
+            a++;
+        }
+
+        for (int a = 1; a < unocc_orb; a++) // a odd
+        {
+            A = a/2;
+            for (int b = a+2; b < unocc_orb; b++) // b odd
+            {
+                B = Speed_Occ - b/2;
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int i = 0; i < n_Electrons; i++) // i even
+                    {
+                        for (int j = i+2; j < n_Electrons; j++) // j even
+                        {
+                            temp = T2_MPI[K][index_counter] / (DEN_AI(a/2+a%2*Speed_Occ,i/2)+DEN_AI(b/2+b%2*Speed_Occ, j/2));
+
+                            t2(a,i)(b/2+b%2*Speed_Occ, j/2) = temp;
+                            t2(b,i)(a/2+a%2*Speed_Occ, j/2) = -temp;
+                            t2(a,j)(b/2+b%2*Speed_Occ, i/2) = -temp;
+                            t2(b,j)(a/2+a%2*Speed_Occ, i/2) = temp;
+
+                            j++;
+                            index_counter += 1;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++) // i odd
+                    {
+                        for (int j = i+2; j < n_Electrons; j++) // j odd
+                        {
+                            temp = T2_MPI[K][index_counter] / (DEN_AI(a/2+a%2*Speed_Occ,i/2)+DEN_AI(b/2+b%2*Speed_Occ, j/2));
+
+                            t2(a,i)(b/2+b%2*Speed_Occ, j/2) = temp;
+                            t2(b,i)(a/2+a%2*Speed_Occ, j/2) = -temp;
+                            t2(a,j)(b/2+b%2*Speed_Occ, i/2) = -temp;
+                            t2(b,j)(a/2+a%2*Speed_Occ, i/2) = temp;
+
+                            j++;
+                            index_counter += 1;
+                        }
+                        i++;
+                    }
+
+                }
+                b++;
+            }
+            a++;
+        }
+
+        for (int a = 0; a < unocc_orb; a++) // a even
+        {
+            A = a/2;
+            for (int b = a+1; b < unocc_orb; b++) // b odd
+            {
+                B = Speed_Occ - b/2;
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int i = 0; i < n_Electrons; i++) // i even
+                    {
+                        for (int j = i+1; j < n_Electrons; j++) // j odd
+                        {
+                            temp = T2_MPI[K][index_counter] / (DEN_AI(a/2+a%2*Speed_Occ,i/2)+DEN_AI(b/2+b%2*Speed_Occ, j/2));
+
+                            t2(a,i)(b/2+b%2*Speed_Occ, j/2) = temp;
+                            t2(b,i)(a/2+a%2*Speed_Occ, j/2) = -temp;
+                            t2(a,j)(b/2+b%2*Speed_Occ, i/2) = -temp;
+                            t2(b,j)(a/2+a%2*Speed_Occ, i/2) = temp;
+
+                            j++;
+                            index_counter += 1;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++) // i odd
+                    {
+                        for (int j = i+1; j < n_Electrons; j++) // j even
+                        {
+                            temp = T2_MPI[K][index_counter] / (DEN_AI(a/2+a%2*Speed_Occ,i/2)+DEN_AI(b/2+b%2*Speed_Occ, j/2));
+
+                            t2(a,i)(b/2+b%2*Speed_Occ, j/2) = temp;
+                            t2(b,i)(a/2+a%2*Speed_Occ, j/2) = -temp;
+                            t2(a,j)(b/2+b%2*Speed_Occ, i/2) = -temp;
+                            t2(b,j)(a/2+a%2*Speed_Occ, i/2) = temp;
+
+                            j++;
+                            index_counter += 1;
+                        }
+                        i++;
+                    }
+                }
+                b++;
+            }
+            a++;
+        }
+
+        for (int a = 1; a < unocc_orb; a++) // a odd
+        {
+            A = a/2;
+            for (int b = a+1; b < unocc_orb; b++) // b even
+            {
+                B = Speed_Occ - b/2;
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int i = 0; i < n_Electrons; i++) // i even
+                    {
+                        for (int j = i+1; j < n_Electrons; j++) // j odd
+                        {
+                            temp = T2_MPI[K][index_counter] / (DEN_AI(a/2+a%2*Speed_Occ,i/2)+DEN_AI(b/2+b%2*Speed_Occ, j/2));
+
+                            t2(a,i)(b/2+b%2*Speed_Occ, j/2) = temp;
+                            t2(b,i)(a/2+a%2*Speed_Occ, j/2) = -temp;
+                            t2(a,j)(b/2+b%2*Speed_Occ, i/2) = -temp;
+                            t2(b,j)(a/2+a%2*Speed_Occ, i/2) = temp;
+
+                            j++;
+                            index_counter += 1;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++) // i odd
+                    {
+                        for (int j = i+1; j < n_Electrons; j++) // j even
+                        {
+                            temp = T2_MPI[K][index_counter] / (DEN_AI(a/2+a%2*Speed_Occ,i/2)+DEN_AI(b/2+b%2*Speed_Occ, j/2));
+
+                            t2(a,i)(b/2+b%2*Speed_Occ, j/2) = temp;
+                            t2(b,i)(a/2+a%2*Speed_Occ, j/2) = -temp;
+                            t2(a,j)(b/2+b%2*Speed_Occ, i/2) = -temp;
+                            t2(b,j)(a/2+a%2*Speed_Occ, i/2) = temp;
+
+                            j++;
+                            index_counter += 1;
+                        }
+                        i++;
+                    }
+                }
+                b++;
+            }
+            a++;
+        }
+
+        for (int a = 0; a < unocc_orb; a++)
+        {
+            for (int i = 0; i < n_Electrons; i++)
+            {
+                INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - i/2;
+
+                if (INDEX_CHECK % size == K)
+                {
+                    T_1_new(a/2, i/2) += T2_MPI[K][index_counter];
+                    index_counter += 1;
+                }
+                i++;
+            }
+            a++;
+        }
+
+        for (int a = 1; a < unocc_orb; a++)
+        {
+            for (int i = 1; i < n_Electrons; i++)
+            {
+                INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - i/2;
+                if (INDEX_CHECK % size == K)
+                {
+                    T_1_new(a/2+Speed_Occ, i/2) += T2_MPI[K][index_counter];
+                    index_counter += 1;
+                }
+                i++;
+            }
+            a++;
         }
     }
 }
 
+void CCSD_Memory_optimized::Prepear_AOs()
+{
+    int matsize = Matrix_Size/2;
 
+    int A,B, INDEX_CHECK;
+    int SENDER;
+    mat ttt;
+
+    MO8.set_size(Speed_Elec, Speed_Elec);
+    ttt = zeros(Speed_Elec, Speed_Elec);
+    for (int a = 0; a < Speed_Elec; a++)
+    {
+        for (int b = a; b < Speed_Elec; b++)
+        {
+
+            MO8(a,b) = ttt;
+        }
+    }
+
+    MO6_1.set_size(Speed_Elec, Speed_Elec);
+    MO6_2.set_size(Speed_Elec, Speed_Elec);
+    ttt = zeros(matsize, matsize);
+    for (int a = 0; a < Speed_Elec; a++)
+    {
+        for (int b = a; b < Speed_Elec; b++)
+        {
+            MO6_1(a,b) = zeros(Speed_Occ, Speed_Elec);
+            MO6_2(a,b) = zeros(Speed_Elec, Speed_Occ);
+        }
+    }
+
+    MO4.set_size(Speed_Elec, Speed_Elec);
+    ttt = zeros(Speed_Occ, Speed_Occ);
+    for (int a = 0; a < Speed_Elec; a++)
+    {
+        for (int b = a; b < Speed_Elec; b++)
+        {
+            MO4(a,b) = ttt;
+        }
+    }
+
+    MO9.set_size(Speed_Occ, Speed_Occ);
+    ttt = zeros(matsize, matsize);
+    for (int a = 0; a < Speed_Occ; a++)
+    {
+        for (int b = a; b < Speed_Occ; b++)
+        {
+            B = Speed_Occ - b;
+            INDEX_CHECK = a*Speed_Occ+B;
+            if (INDEX_CHECK % size == rank)
+            {
+                MO9(a,b) = ttt;
+            }
+        }
+    }
+
+    MO2.set_size(Speed_Occ, Speed_Elec);
+    MO10.set_size(Speed_Occ, Speed_Elec);
+    MO3.set_size(Speed_Occ, Speed_Elec);
+    ttt = zeros(matsize, matsize);
+    for (int a = 0; a < Speed_Occ; a++)
+    {
+        for (int b = 0; b < Speed_Elec; b++)
+        {
+            INDEX_CHECK = a * Speed_Elec + Speed_Elec - b;
+            if (INDEX_CHECK % size == rank)
+            {
+                MO10(a,b) = ttt;
+                MO2(a,b) = zeros(Speed_Occ, Speed_Elec);
+                MO3(a,b) = zeros(Speed_Elec, Speed_Occ);
+            }
+        }
+    }
+
+    ttt = zeros(Speed_Elec, Speed_Elec);
+    MOLeftovers.set_size(Speed_Occ, Speed_Occ);
+    for (int a = 0; a < Speed_Occ; a++)
+    {
+        for (int b = 0; b < Speed_Occ; b++)
+        {
+            MOLeftovers(a,b) = ttt;
+        }
+    }
+
+    // Now we are ready to construct MOs, however there is a problem.
+    // Hartree Fock runs in parallel, we do not store all AOs on all threads
+    // This is a major problem, and must be solved with communication
+    // This is done here by checking first who has the information we need, and bribing this node, to get the information out of him
+    // Because of this, our CCSD is now locked to our HF implementation, meaning we cannot use any other Hartree Fock implementation
+    // unless we change the lines of code in this function
+
+    int index_counter;
+    int send_size = matsize * matsize;
+    double *send_matrix_MPI = (double*) malloc(matsize*matsize*sizeof(double));
+    mat recieve_matrix = zeros(matsize, matsize);
+
+    for (int a = 0; a < Speed_Elec; a++)
+    {
+        compact_mo = zeros(matsize, matsize, matsize);
+        for (int k = 0; k < matsize; k++)
+        {
+            for (int i = 0; i < matsize; i++)
+            {
+                SENDER = (i+k)%size;
+                if (SENDER == rank)
+                {
+                    recieve_matrix = HartFock->Return_Field_Q(i, k);
+                    index_counter = 0;
+                    for (int j = 0; j < matsize; j++)
+                    {
+                        for (int l = 0; l < matsize; l++)
+                        {
+                            send_matrix_MPI[index_counter] = recieve_matrix(j,l);
+                            index_counter += 1;
+                        }
+                    }
+                }
+
+                MPI_Bcast(send_matrix_MPI, send_size, MPI_DOUBLE, SENDER, MPI_COMM_WORLD);
+
+                index_counter = 0;
+                for (int j = 0; j < matsize; j++)
+                {
+                    for (int l = 0; l < matsize; l++)
+                    {
+                        recieve_matrix(j,l) = send_matrix_MPI[index_counter];
+                        index_counter += 1;
+                    }
+                }
+
+                for (int j = 0; j < matsize; j++)
+                {
+                    for (int l = 0; l < matsize; l++)
+                    {
+                        // We need to get these integrals here somehow
+                        compact_mo(j,k,l) += c(i,a) * recieve_matrix(j,l); // This solution has the AOs distributed among threads and uses communication
+                                //HartFock->Calc_Integrals_On_The_Fly(i,k,j,l); // This solution calculates integrals on the fly
+                        //Integrals(Return_Integral_Index(i,j,k,l)); // This solution stored integrals as compounded index
+                    }
+                }
+            }
+        }
+
+        compact_mo2 = zeros(matsize, matsize, matsize);
+        for (int b = 0; b < matsize; b++)
+        {
+            for (int i = 0; i < matsize; i++)
+            {
+                for (int j = 0; j < matsize; j++)
+                {
+                    for (int k = 0; k < matsize; k++)
+                    {
+                        compact_mo2(b,j,k) += c(i,b) * compact_mo(i,j,k);
+                    }
+                }
+            }
+        }
+
+        compact_mo = zeros(matsize, matsize, matsize);
+        for (int b = 0; b < matsize; b++)
+        {
+            for (int g = 0; g < matsize; g++)
+            {
+                for (int i = 0; i < matsize; i++)
+                {
+                    for (int j = 0; j < matsize; j++)
+                    {
+                        compact_mo(b,g,j) += c(i,g) * compact_mo2(b,i,j);
+                    }
+                }
+            }
+        }
+
+        compact_mo2 = zeros(matsize, matsize, matsize);
+
+        for (int b = 0; b < matsize; b++)
+        {
+            for (int g = 0; g < matsize; g++)
+            {
+                for (int h = 0; h < matsize; h++)
+                {
+                    for (int i = 0; i < matsize; i++)
+                    {
+                        compact_mo2(b,g,h) += c(i,h) * compact_mo(b,g,i);
+                    }
+                }
+            }
+        }
+
+
+            for (int i = a; i < Speed_Elec; i++)
+            {
+                    for (int b = Speed_Elec; b < matsize; b++)
+                    {
+                        for (int j = 0; j < Speed_Elec; j++)
+                        {
+                            MO6_1(a,i)(b-Speed_Elec,j) = compact_mo2(b,i,j);
+                        }
+                    }
+            }
+
+            for (int i = a; i < Speed_Elec; i++)
+            {
+                    for (int b = 0; b < Speed_Elec; b++)
+                    {
+                        for (int j = Speed_Elec; j < matsize; j++)
+                        {
+                            MO6_2(a,i)(b,j-Speed_Elec) = compact_mo2(b,i,j);
+                        }
+                    }
+            }
+
+            for (int i = a; i < Speed_Elec; i++)
+            {
+                    for (int b = 0; b < Speed_Elec; b++)
+                    {
+                        for (int j = 0; j < Speed_Elec; j++)
+                        {
+                            MO8(a,i)(b,j) = compact_mo2(b,i,j);
+                        }
+                    }
+            }
+
+            // MO4 will not be distributed, but it is relatively small
+            for (int i = a; i < Speed_Elec; i++)
+            {
+                    for (int b = Speed_Elec; b < matsize; b++)
+                    {
+                        for (int j = Speed_Elec; j < matsize; j++)
+                        {
+                            MO4(a,i)(b-Speed_Elec,j-Speed_Elec) = compact_mo2(b,i,j);
+                        }
+                    }
+            }
+
+    }
+
+    for (int a = Speed_Elec; a < matsize; a++)
+    {
+        compact_mo = zeros(matsize, matsize, matsize);
+        for (int k = 0; k < matsize; k++)
+        {
+            for (int i = 0; i < matsize; i++)
+            {
+
+                SENDER = (i+k)%size;
+                if (SENDER == rank)
+                {
+                    recieve_matrix = HartFock->Return_Field_Q(i, k);
+                    index_counter = 0;
+                    for (int j = 0; j < matsize; j++)
+                    {
+                        for (int l = 0; l < matsize; l++)
+                        {
+                            send_matrix_MPI[index_counter] = recieve_matrix(j,l);
+                            index_counter += 1;
+                        }
+                    }
+                }
+
+                MPI_Bcast(send_matrix_MPI, send_size, MPI_DOUBLE, SENDER, MPI_COMM_WORLD);
+
+                index_counter = 0;
+                for (int j = 0; j < matsize; j++)
+                {
+                    for (int l = 0; l < matsize; l++)
+                    {
+                        recieve_matrix(j,l) = send_matrix_MPI[index_counter];
+                        index_counter += 1;
+                    }
+                }
+
+
+                for (int j = 0; j < matsize; j++)
+                {
+                    for (int l = 0; l < matsize; l++)
+                    {
+                        compact_mo(j,k,l) += c(i,a) * recieve_matrix(j,l); // Communication and distributed memory
+                        //HartFock->Calc_Integrals_On_The_Fly(i,k,j,l); // on the fly calculation, not implemented in parallel jet. Should not be needed
+                        //Integrals(Return_Integral_Index(i,j,k,l)); // compounded index storage
+                    }
+                }
+            }
+        }
+
+        compact_mo2 = zeros(matsize, matsize, matsize);
+        for (int b = 0; b < matsize; b++)
+        {
+            for (int i = 0; i < matsize; i++)
+            {
+                for (int j = 0; j < matsize; j++)
+                {
+                    for (int k = 0; k < matsize; k++)
+                    {
+                        compact_mo2(b,j,k) += c(i,b) * compact_mo(i,j,k);
+                    }
+                }
+            }
+        }
+
+        compact_mo = zeros(matsize, matsize, matsize);
+        for (int b = 0; b < matsize; b++)
+        {
+            for (int g = 0; g < matsize; g++)
+            {
+                for (int i = 0; i < matsize; i++)
+                {
+                    for (int j = 0; j < matsize; j++)
+                    {
+                        compact_mo(b,g,j) += c(i,g) * compact_mo2(b,i,j);
+                    }
+                }
+            }
+        }
+
+        compact_mo2 = zeros(matsize, matsize, matsize);
+
+        for (int b = 0; b < matsize; b++)
+        {
+            for (int g = 0; g < matsize; g++)
+            {
+                for (int h = 0; h < matsize; h++)
+                {
+                    for (int i = 0; i < matsize; i++)
+                    {
+                        compact_mo2(b,g,h) += c(i,h) * compact_mo(b,g,i);
+                    }
+                }
+            }
+        }
+
+            A = a - Speed_Elec;
+
+            for (int b = 0; b < Speed_Elec; b++)
+            {
+                // MOLeftovers one is not distributed, but it is relatively small
+                for (int i = Speed_Elec; i < matsize; i++)
+                {
+                    for (int j = 0; j < Speed_Elec; j++)
+                    {
+                        MOLeftovers(a-Speed_Elec,i-Speed_Elec)(b,j) = compact_mo2(b,i,j);
+                    }
+                }
+            }
+
+            for (int i = a; i < matsize; i++) // (0 -> Speed_Occ) is equal to (a -> matsize) - Speed_Elec
+            {
+                B = Speed_Occ - (i - Speed_Elec);
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == rank) // Only the threads who NEED the memory will store it, this is memory distribution :-D
+                {
+                    for (int b = 0; b < matsize; b++)
+                    {
+                        for (int j = 0; j < matsize; j++)
+                        {
+                            MO9(a-Speed_Elec,i-Speed_Elec)(b,j) = compact_mo2(b,i,j);
+                        }
+                    }
+                }
+            }
+
+            for (int j = 0; j < Speed_Elec; j++) // <-- j
+            {
+                INDEX_CHECK = A*Speed_Elec + Speed_Elec - j;
+                if (INDEX_CHECK % size == rank)
+                {
+                    for (int b = Speed_Elec; b < matsize; b++)
+                    {
+                        for (int i = 0; i < Speed_Elec; i++)
+                        {
+                            MO2(a-Speed_Elec,j)(b-Speed_Elec,i) = compact_mo2(b,i,j); // <-- different indexing vs MO10 & MO3
+                        }
+                    }
+                }
+            }
+
+            for (int i = 0; i < Speed_Elec; i++)
+            {
+                INDEX_CHECK = A*Speed_Elec + Speed_Elec - i;
+                if (INDEX_CHECK % size == rank)
+                {
+                    for (int b = Speed_Elec; b < matsize; b++)
+                    {
+                        for (int j = 0; j < Speed_Elec; j++)
+                        {
+                            MO3(a-Speed_Elec,i)(j,b-Speed_Elec) = compact_mo2(i,j,b); // <-- different indexing vs MO10 & MO2
+                        }
+                    }
+                }
+            }
+
+            for (int i = 0; i < Speed_Elec; i++) // <-- i
+            {
+                INDEX_CHECK = A*Speed_Elec + Speed_Elec - i;
+                if (INDEX_CHECK % size == rank)
+                {
+                    for (int b = 0; b < matsize; b++)
+                    {
+                        for (int j = 0; j < matsize; j++)
+                        {
+                            MO10(a-Speed_Elec,i)(b,j) = compact_mo2(b,i,j); // <-- different indexing vs MO2 & MO3
+                        }
+                    }
+                }
+            }
+
+    }
+
+    compact_mo = zeros(1,1,1); // Remove this memory, .clear didnt work, needs more armadillo knowledge :-O
+    compact_mo2 = zeros(1,1,1); // Remove this memory, .clear didnt work, just put it to 1x1x1 for now :-O
+
+    Integrals.clear();
+    c.clear();
+}
+
+long int CCSD_Memory_optimized::Return_Integral_Index(int a, int b, int i, int j)
+{
+    long int ab, ij;
+
+    if (a > b)
+    {
+        ab = (a*(a+1))/2 + b;
+    }
+
+    else
+    {
+        ab = (b*(b+1))/2 + a;
+    }
+
+    if (i > j)
+    {
+        ij = (i*(i+1))/2 + j;
+    }
+
+    else
+    {
+        ij = (j*(j+1))/2 + i;
+    }
+
+    if (ab > ij)
+    {
+        return ((ab*(ab+1)/2) + ij);
+    }
+
+    else
+    {
+        return ((ij*(ij+1)/2) + ab);
+    }
+}
+
+mat CCSD_Memory_optimized::Fill_FS(vec eigval)
+{
+    mat fss = zeros(Matrix_Size, Matrix_Size);
+
+    for (int i = 0; i < Matrix_Size; i++)
+    {
+        fss(i,i) = eigval(i/2); // Diagonal matrise
+    }
+
+    return fss;
+}
+
+void CCSD_Memory_optimized::Fill_integ2_2D(int a, int i)
+{
+    int B,J;
+
+    if (a%2 == 0 && i%2==0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ2_2D(B,J) = -MOLeftovers(a/2, b/2)(j/2, i/2)+MOLeftovers(a/2, b/2)(i/2, j/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ2_2D(B+Speed_Occ,J) = MOLeftovers(a/2, b/2)(i/2, j/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+    }
+
+    else if (a%2 == 0 && i%2==1)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ2_2D(B,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ2_2D(B+Speed_Occ,J) = -MOLeftovers(a/2, b/2)(j/2, i/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+    }
+
+    else if (a%2 == 1 && i%2==0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ2_2D(B,J) = -MOLeftovers(a/2, b/2)(j/2, i/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ2_2D(B+Speed_Occ,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+    }
+
+    else
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ2_2D(B,J) = MOLeftovers(a/2, b/2)(i/2, j/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ2_2D(B+Speed_Occ,J) = MOLeftovers(a/2, b/2)(i/2, j/2) - MOLeftovers(a/2, b/2)(j/2,i/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+    }
+}
+
+void CCSD_Memory_optimized::Fill_integ3_2D(int a, int i)
+{
+    int B,J;
+    double val1, val2;
+
+    int A = a/2;
+    int I = i/2;
+
+    if (a%2 == 0 && i%2 == 0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < unocc_orb; j++)
+            {
+                integ3_2D(B,J) = MO9(A, I)(B+Speed_Elec, (J+Speed_Elec)) - MO9(A, I)(J+Speed_Elec, (B+Speed_Elec));
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        // Lower half of matrix = 0, apparantly slower
+        //integ3_2D(span(Speed_Occ, unocc_orb-1), span()) = Zero_Matrix;
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < unocc_orb; j++)
+            {
+                integ3_2D(B+Speed_Occ,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+
+    }
+
+    else if (a%2 == 1 && i%2 == 1)
+    {
+        // Upper half of matrix = 0
+        //integ3_2D(span(0, Speed_Occ-1), span()) = Zero_Matrix;
+
+
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < unocc_orb; j++)
+            {
+                val1 = EqualFunc(a%2, b%2) * EqualFunc(i%2, j%2) *
+                        MO9(A, I)(B+Speed_Elec, (J+Speed_Elec));
+
+                val2 = EqualFunc(a%2, j%2) * EqualFunc(i%2, b%2) *
+                        MO9(A, I)(j/2+Speed_Elec, (B+Speed_Elec));
+
+                integ3_2D(B,J) = val1-val2;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < unocc_orb; j++)
+            {
+                integ3_2D(B+Speed_Occ,J) =  MO9(A, I)(B+Speed_Elec, (J+Speed_Elec)) - MO9(A, I)(J+Speed_Elec, (B+Speed_Elec));
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else if (a%2 == 0 && i%2 == 1)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < unocc_orb; j++)
+            {
+                integ3_2D(B,J) = MO9(A, I)(B+Speed_Elec, (J+Speed_Elec));
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < unocc_orb; j++)
+            {
+                integ3_2D(B+Speed_Occ,J) = -MO9(A, I)(J+Speed_Elec, (B+Speed_Elec));
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < unocc_orb; j++)
+            {
+                integ3_2D(B,J) = -MO9(A, I)(J+Speed_Elec, (B+Speed_Elec));
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < unocc_orb; j++)
+            {
+                integ3_2D(B+Speed_Occ,J) = MO9(A, I)(B+Speed_Elec, (J+Speed_Elec));
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+}
+
+void CCSD_Memory_optimized::Fill_integ4_2D(int a, int i)
+{
+    int B,J;
+    int A = a/2;
+    int I = i/2;
+
+    if (a%2 == 0 && i%2 == 0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < unocc_orb; j++)
+            {
+                integ4_2D(B,J) = MO4(A, I)(B, J) - MO4(A, I)(J, B);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+
+       // integ4_2D(span(Speed_Occ, unocc_orb-1), span()) = Zero_Matrix;
+
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < unocc_orb; j++)
+            {
+                integ4_2D(B+Speed_Occ,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+    }
+
+    else if (a%2 == 1 && i%2 == 0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < unocc_orb; j++)
+            {
+                integ4_2D(B,J) = - MO4(A, I)(J, B);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < unocc_orb; j++)
+            {
+                integ4_2D(B+Speed_Occ,J) = MO4(A, I)(B, J);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else if (a%2 == 1 && i%2 == 1)
+    {
+        //integ4_2D(span(0, Speed_Occ-1),span()) = Zero_Matrix;
+
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < unocc_orb; j++)
+            {
+                integ4_2D(B,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < unocc_orb; j++)
+            {
+                integ4_2D(B+Speed_Occ,J) = MO4(A, I)(B, J) - MO4(A, I)(J, B);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < unocc_orb; j++)
+            {
+                integ4_2D(B,J) = MO4(A, I)(B, J);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < unocc_orb; j++)
+            {
+                integ4_2D(B+Speed_Occ,J) = - MO4(A, I)(J, B);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+}
+
+void CCSD_Memory_optimized::Fill_integ5_2D(int a, int i)
+{
+    int B,J;
+    if (a%2 == 0 && i%2 == 0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < unocc_orb; j++)
+            {
+                integ5_2D(B,J) =  MO10(a/2, i/2)(b/2+Speed_Elec, j/2+Speed_Elec)-MO10(a/2, i/2)(j/2+Speed_Elec, b/2+Speed_Elec);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < unocc_orb; j++)
+            {
+                integ5_2D(B+Speed_Occ,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else if (a%2 == 1 && i%2 == 1)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < unocc_orb; j++)
+            {
+                integ5_2D(B,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < unocc_orb; j++)
+            {
+                integ5_2D(B+Speed_Occ,J) = MO10(a/2, i/2)(b/2+Speed_Elec, j/2+Speed_Elec)-MO10(a/2, i/2)(j/2+Speed_Elec, b/2+Speed_Elec);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else if (a%2 == 1 && i%2 == 0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < unocc_orb; j++)
+            {
+                integ5_2D(B,J) = -MO10(a/2, i/2)(j/2+Speed_Elec, b/2+Speed_Elec);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < unocc_orb; j++)
+            {
+                integ5_2D(B+Speed_Occ,J) = MO10(a/2, i/2)(b/2+Speed_Elec, j/2+Speed_Elec);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < unocc_orb; j++)
+            {
+                integ5_2D(B,J) = MO10(a/2, i/2)(b/2+Speed_Elec, j/2+Speed_Elec);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < unocc_orb; j++)
+            {
+                integ5_2D(B+Speed_Occ,J) = -MO10(a/2, i/2)(j/2+Speed_Elec, b/2+Speed_Elec);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+}
+
+void CCSD_Memory_optimized::Fill_integ6_2D(int a, int i)
+{
+    int B,J;
+    int A = a/2;
+    int I = i/2;
+
+    if (a%2 == 0 && i%2 == 0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ6_2D(B,J) = MO6_1(A, I)(B, J) - MO6_2(A, I)(J, B);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ6_2D(B+Speed_Occ,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else if (a%2 == 1 && i%2 == 0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ6_2D(B,J) = -MO6_2(A, I)(J, B);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ6_2D(B+Speed_Occ,J) = MO6_1(A, I)(B, J);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else if (a%2 == 1 && i%2 == 1)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ6_2D(B,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ6_2D(B+Speed_Occ,J) = MO6_1(A, I)(B, J)-MO6_2(A, I)(J, B);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+
+    else
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ6_2D(B,J) = MO6_1(A, I)(B, J);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ6_2D(B+Speed_Occ,J) = -MO6_2(A, I)(J, B);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+}
+
+void CCSD_Memory_optimized::Fill_integ7_2D(int a, int i)
+{
+    int B,J;
+    if (a%2 == 1 && i%2 == 1)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ7_2D(B+Speed_Occ,J) =  MO10(a/2, i/2)(b/2+Speed_Elec, j/2)-MO10(a/2, i/2)(j/2, b/2+Speed_Elec);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ7_2D(B,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else if (a%2 == 1 && i%2 == 0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ7_2D(B,J) =  -MO10(a/2, i/2)(j/2, b/2+Speed_Elec);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ7_2D(B+Speed_Occ,J) = MO10(a/2, i/2)(b/2+Speed_Elec, j/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else if (a%2==0 && i%2==1)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ7_2D(B+Speed_Occ,J) =  -MO10(a/2, i/2)(j/2, b/2+Speed_Elec);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ7_2D(B,J) = MO10(a/2, i/2)(b/2+Speed_Elec, j/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else if (a%2 == 0 && i%2 == 0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ7_2D(B,J) =  MO10(a/2, i/2)(b/2+Speed_Elec, j/2)-MO10(a/2, i/2)(j/2, b/2+Speed_Elec);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ7_2D(B+Speed_Occ,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ7_2D(B,J) =  -MO10(a/2, i/2)(j/2, b/2+Speed_Elec);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ7_2D(B+Speed_Occ,J) = MO10(a/2, i/2)(b/2+Speed_Elec, j/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+}
+
+void CCSD_Memory_optimized::Fill_integ8_2D(int a, int i)
+{
+    int B,J;
+    int A = a/2;
+    int I = i/2;
+    if (a%2 == 0 && i%2 == 0)
+    {
+        B = 0;
+        for (int b = 0; b < n_Electrons; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ8_2D(B,J) = MO8(A, I)(B, J) - MO8(A, I)(J, B);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < n_Electrons; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ8_2D(B+Speed_Elec,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else if(a%2 == 1 && i%2 == 1)
+    {
+        B = 0;
+        for (int b = 0; b < n_Electrons; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ8_2D(B,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < n_Electrons; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ8_2D(B+Speed_Elec,J) = MO8(A, I)(B, J) - MO8(A, I)(J, B);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else if (a%2 == 0 && i%2 == 1)
+    {
+        B = 0;
+        for (int b = 0; b < n_Electrons; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ8_2D(B,J) = MO8(A, I)(B, J);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < n_Electrons; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ8_2D(B+Speed_Elec,J) = -MO8(A, I)(J, B);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else
+    {
+        B = 0;
+        for (int b = 0; b < n_Electrons; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ8_2D(B,J) = -MO8(A, I)(J, B);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < n_Electrons; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ8_2D(B+Speed_Elec,J) = MO8(A, I)(B, J);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+}
+
+void CCSD_Memory_optimized::Fill_integ9_2D(int a, int i)
+{
+    int B,J;
+    double val1, val2;
+
+    if ((a+i)%2 == 0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                val1 = EqualFunc(a%2, b%2) * EqualFunc(i%2, j%2) *
+                        MO9(a/2, i/2)(b/2+Speed_Elec, (j/2));
+
+                val2 = EqualFunc(a%2, j%2) * EqualFunc(i%2, b%2) *
+                        MO9(a/2, i/2)(j/2, (b/2+Speed_Elec));
+
+                integ9_2D(B,J) = val1-val2;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                val1 = EqualFunc(a%2, b%2) * EqualFunc(i%2, j%2) *
+                        MO9(a/2, i/2)(b/2+Speed_Elec, (j/2));
+
+                val2 = EqualFunc(a%2, j%2) * EqualFunc(i%2, b%2) *
+                        MO9(a/2, i/2)(j/2, (b/2+Speed_Elec));
+
+                integ9_2D(B+Speed_Occ,J) = val1-val2;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                val1 = EqualFunc(a%2, b%2) * EqualFunc(i%2, j%2) *
+                        MO9(a/2, i/2)(b/2+Speed_Elec, (j/2));
+
+                val2 = EqualFunc(a%2, j%2) * EqualFunc(i%2, b%2) *
+                        MO9(a/2, i/2)(j/2, (b/2+Speed_Elec));
+
+                integ9_2D(B,J) = val1-val2;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                val1 = EqualFunc(a%2, b%2) * EqualFunc(i%2, j%2) *
+                        MO9(a/2, i/2)(b/2+Speed_Elec, (j/2));
+
+                val2 = EqualFunc(a%2, j%2) * EqualFunc(i%2, b%2) *
+                        MO9(a/2, i/2)(j/2, (b/2+Speed_Elec));
+
+                integ9_2D(B+Speed_Occ,J) = val1-val2;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+}
+
+void CCSD_Memory_optimized::Fill_integ10_2D(int a, int i)
+{
+    double temp1, temp2;
+
+    int B,J;
+    if (a%2 == 0)
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ10_2D(B,J) = MO2(a/2, i/2)(b/2, j/2) - MO3(a/2, i/2)(j/2, b/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ10_2D(B+Speed_Occ,J) = - MO3(a/2, i/2)(j/2, b/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+
+    else
+    {
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ10_2D(B,J) = - MO3(a/2, i/2)(j/2, b/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ10_2D(B+Speed_Occ,J) = MO2(a/2, i/2)(b/2, j/2) - MO3(a/2, i/2)(j/2, b/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+    }
+}
+
+void CCSD_Memory_optimized::Map_T2_For_MPI()
+{
+    // This function is designed to map out T2 new in a way such that the parallel implementation is effective
+    // Also to ensure we do not store symmetric terms and pass symmetric terms through parallel
+
+    int number_counter;
+    int A,B;
+    int INDEX_CHECK;
+
+    T2_MPI = (double**) malloc(size * sizeof(double *));
+    WORK_EACH_NODE = zeros(size);
+
+    // Not superb work distribution, but this way ensures somewhat of a communication minimization
+    // Communication is only one broadcast per thread per iteration this way,
+    // since all work done by one node is stored in one array, and this is broadcasted in one MPI_Bcast call
+
+    for (int K = 0; K < size; K++)
+    {
+        number_counter = 0;
+
+        for (int a = 0; a < unocc_orb; a++)
+        {
+            A = a/2;
+            for (int b = a+2; b < unocc_orb; b++)
+            {
+
+                B = Speed_Occ - b/2;
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == K)
+                {
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        for (int j = i+2; j < n_Electrons; j++)
+                        {
+
+                            number_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+                }
+
+                b++;
+            }
+            a++;
+        }
+
+        for (int a = 1; a < unocc_orb; a++)
+        {
+            A = a/2;
+
+            for (int b = a+2; b < unocc_orb; b++)
+            {
+                B = Speed_Occ - b/2;
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == K)
+                {
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        for (int j = i+2; j < n_Electrons; j++)
+                        {
+
+                            number_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        for (int j = i+2; j < n_Electrons; j++)
+                        {
+                            number_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+                }
+
+                b++;
+            }
+            a++;
+        }
+
+        for (int a = 1; a < unocc_orb; a++)
+        {
+            A = a/2;
+
+
+            for (int b = a+1; b < unocc_orb; b++)
+            {
+                B = Speed_Occ - b/2;
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == K)
+                {
+
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+
+                            number_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+
+                            number_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+                }
+                b++;
+            }
+            a++;
+        }
+
+        for (int a = 0; a < unocc_orb; a++)
+        {
+            A = a/2;
+
+
+            for (int b = a+1; b < unocc_orb; b++)
+            {
+                B = Speed_Occ - b/2;
+                INDEX_CHECK = A*Speed_Occ+B;
+
+                if (INDEX_CHECK % size == K)
+                {
+
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+
+                            number_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+
+                            number_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+                }
+                b++;
+            }
+            a++;
+        }
+
+        for (int a = 0; a < unocc_orb; a++)
+        {
+            for (int i = 0; i < n_Electrons; i++)
+            {
+                INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - i/2;
+                if (INDEX_CHECK % size == K)
+                {
+                    number_counter += 1;
+                }
+
+                i++;
+            }
+            a++;
+        }
+
+        for (int a = 1; a < unocc_orb; a++)
+        {
+            for (int i = 1; i < n_Electrons; i++)
+            {
+                INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - i/2;
+                if (INDEX_CHECK % size == K)
+                {
+                    number_counter += 1;
+                }
+                i++;
+            }
+            a++;
+        }
+
+
+
+
+        if (rank==0)
+        {
+            cout << "Work : " << number_counter << " for node " << K << endl;
+        }
+
+        WORK_EACH_NODE(K) = number_counter;
+
+        // Determine the size of nodes T2 calculations
+        T2_MPI[K] = (double*) malloc(number_counter*sizeof(double));
+
+    }
+}
+
+void CCSD_Memory_optimized::Fill_W4_MPI()
+{
+
+    int index_counter = 0;
+    int INDEX_CHECK;
+
+    for (int a = 0; a < unocc_orb; a++)
+    {
+        for (int m = 0; m < n_Electrons; m++)
+        {
+            INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+                Fill_integ7_2D(a,m);
+                Fill_integ5_2D(a,m);
+
+                for (int e = 0; e < unocc_orb; e++)
+                {
+                    Fill_integ2_2D_even_even(e, m);
+                    for(int i = 0; i < n_Electrons; i++)
+                    {
+                        Part1_MPI[rank][index_counter] = -integ7_2D(e/2,i/2) - accu(W_3.at(i,m)(e/2,span()) % T_1.row(a/2))
+                                + accu(integ5_2D(span(0, Speed_Occ-1),e/2) % T_1(span(0, Speed_Occ-1),i/2))
+                                + 0.5*accu(integ2_2D % t2.at(a,i));
+                        index_counter += 1;
+                        i++;
+                    }
+                    e++;
+                }
+            }
+            m++;
+        }
+        a++;
+    }
+
+    for (int a = 1; a < unocc_orb; a++)
+    {
+        for (int m = 0; m < n_Electrons; m++)
+        {
+            INDEX_CHECK = a/2 *Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+
+                Fill_integ7_2D(a,m);
+                Fill_integ5_2D(a,m);
+
+                for (int e = 0; e < unocc_orb; e++)
+                {
+                    Fill_integ2_2D_even_even(e, m);
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        Part1_MPI[rank][index_counter] = -integ7_2D(e/2,i/2) - accu(W_3.at(i,m)(e/2,span()) % T_1.row(a/2+Speed_Occ))
+                                + accu(integ5_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1),e/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1),i/2))
+                                + 0.5*accu(integ2_2D % t2.at(a,i));;
+                        index_counter += 1;
+                        i++;
+                    }
+                    e++;
+                }
+
+                for (int e = 1; e < unocc_orb; e++)
+                {
+                    Fill_integ2_2D_odd_even(e, m);
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        Part1_MPI[rank][index_counter] = -integ7_2D(e/2+Speed_Occ,i/2) - accu(W_3.at(i,m)(e/2+Speed_Occ,span()) % T_1.row(a/2+Speed_Occ))
+                                + accu(integ5_2D(span(0, Speed_Occ-1),e/2) % T_1(span(0, Speed_Occ-1),i/2))
+                                + 0.5*accu(integ2_2D % t2.at(a,i));
+                        index_counter += 1;
+                        i++;
+                    }
+                    e++;
+                }
+            }
+            m++;
+        }
+        a++;
+    }
+
+    for (int a = 0; a < unocc_orb; a++)
+    {
+        for (int m = 1; m < n_Electrons; m++)
+        {
+            INDEX_CHECK = a/2 *Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+
+                Fill_integ7_2D(a,m);
+                Fill_integ5_2D(a,m);
+
+                for (int e = 0; e < unocc_orb; e++)
+                {
+                    Fill_integ2_2D_even_odd(e, m);
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        Part1_MPI[rank][index_counter] = -integ7_2D(e/2,i/2) - accu(W_3.at(i,m)(e/2,span()) % T_1.row(a/2))
+                                + accu(integ5_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1),e/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1),i/2))
+                                + 0.5*accu(integ2_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()) % t2.at(a,i)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()));
+                        index_counter += 1;
+                        i++;
+                    }
+                    e++;
+                }
+
+                for (int e = 1; e < unocc_orb; e++)
+                {
+                    Fill_integ2_2D_odd_odd(e, m);
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        Part1_MPI[rank][index_counter] = -integ7_2D(e/2+Speed_Occ,i/2) - accu(W_3.at(i,m)(e/2,span()) % T_1.row(a/2+a%2*Speed_Occ))
+                                + accu(integ5_2D(span(0, Speed_Occ-1),e/2) % T_1(span(0, Speed_Occ-1),i/2))
+                                + 0.5*accu(integ2_2D % t2.at(a,i));
+                        index_counter += 1;
+                        i++;
+                    }
+                    e++;
+                }
+            }
+            m++;
+        }
+        a++;
+    }
+
+    for (int a = 1; a < unocc_orb; a++)
+    {
+        for (int m = 1; m < n_Electrons; m++)
+        {
+            INDEX_CHECK = a/2 *Speed_Elec + Speed_Elec - m/2;
+            if (INDEX_CHECK % size == rank)
+            {
+
+            Fill_integ7_2D(a,m);
+            Fill_integ5_2D(a,m);
+                for (int e = 0; e < unocc_orb; e++)
+                {
+                    Fill_integ2_2D_even_odd(e, m);
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        Part1_MPI[rank][index_counter] = -integ7_2D(e/2,i/2) - accu(W_3.at(i,m)(e/2,span()) % T_1.row(a/2+Speed_Occ))
+                                + 0.5*accu(integ2_2D(span(0, Speed_Occ-1), span()) % t2.at(a,i)(span(0,Speed_Occ-1), span()));
+                        index_counter += 1;
+                        i++;
+                    }
+                    e++;
+                }
+
+                for (int e = 1; e < unocc_orb; e++)
+                {
+                    Fill_integ2_2D_odd_odd(e, m);
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        Part1_MPI[rank][index_counter] = -integ7_2D(e/2+Speed_Occ,i/2) - accu(W_3.at(i,m)(e/2+Speed_Occ,span()) % T_1.row(a/2+Speed_Occ))
+                                + accu(integ5_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1),e/2) % T_1(span(Speed_Occ, Speed_Occ+Speed_Occ-1),i/2))
+                                + 0.5*accu(integ2_2D % t2.at(a,i));
+                        index_counter += 1;
+                        i++;
+                    }
+                    e++;
+                }
+            }
+            m++;
+        }
+        a++;
+    }
+
+
+    // Communicate
+    int work;
+    for (int X = 0; X < size; X++)
+    {
+        work = WORK_EACH_NODE_Part2(X);
+        MPI_Bcast(Part1_MPI[X], work, MPI_DOUBLE, X, MPI_COMM_WORLD);
+    }
+
+
+}
+
+void CCSD_Memory_optimized::Map_Part1_For_MPI()
+{
+    // Mapping of how much work goes where for part 1 of MPI
+    // Mapping is done for communication minimization and this will only be called way before iterations start
+    // How much work per node is actually calculated before any work is done, and will in future be implemented in a script
+
+    // ------------------------------------------------------------------------------------------------------------------------
+    // This way you can know how your scaling will be PRIOR to initiating a supercomputer run which will take meny hours
+    // This will be awsome
+    // ------------------------------------------------------------------------------------------------------------------------
+
+    // This function will need some aditional terms, for initialization of W_1 and W_2 :O
+
+    Part1_MPI = (double**)malloc(size*sizeof(double*));
+    WORK_EACH_NODE_Part1 = zeros(size);
+    WORK_EACH_NODE_Part2 = zeros(size);
+    int index_counter;
+    int index_counter2;
+    int INDEX_CHECK;
+
+    for (int K = 0; K < size; K++)
+    {
+        index_counter = 0;
+        for (int k = 0; k < n_Electrons; k++)
+        {
+            for (int l = 1; l < k; l++)
+            {
+                INDEX_CHECK = k/2*Speed_Elec + Speed_Elec-l/2;
+
+                if (INDEX_CHECK % size == K)
+                {
+
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        index_counter += 1;
+                        i++;
+                    }
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            index_counter += 1;
+                            e++;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            index_counter += 1;
+                            e++;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+
+                }
+
+                l++;
+            }
+
+            for (int l = k+1; l < n_Electrons; l++)
+            {
+                INDEX_CHECK = k/2*Speed_Elec + Speed_Elec-l/2;
+
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        index_counter += 1;
+                        i++;
+                    }
+                }
+
+                l++;
+            }
+            k++;
+        }
+
+        for (int k = 1; k < n_Electrons; k++)
+        {
+            for (int l = 0; l < k; l++)
+            {
+                INDEX_CHECK = k/2*Speed_Elec + Speed_Elec-l/2;
+
+                if (INDEX_CHECK % size == K)
+                {
+
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        index_counter += 1;
+                        i++;
+                    }
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            index_counter += 1;
+                            e++;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            index_counter += 1;
+                            e++;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+                }
+                l++;
+            }
+
+            for (int l = k+1; l < n_Electrons; l++)
+            {
+                INDEX_CHECK = k/2*Speed_Elec + Speed_Elec-l/2;
+
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        index_counter += 1;
+                        i++;
+                    }
+                }
+                l++;
+            }
+            k++;
+        }
+
+        for (int k = 0; k < n_Electrons; k++)
+        {
+            for (int l = 0; l < k+1; l++)
+            {
+                INDEX_CHECK = k/2*Speed_Elec + Speed_Elec-l/2;
+
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        index_counter += 1;
+                        i++;
+                    }
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            index_counter += 1;
+                            e++;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        for (int j = i+2; j < n_Electrons; j++)
+                        {
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+                }
+                l++;
+            }
+
+            for (int l = k+2; l < n_Electrons; l++)
+            {
+                INDEX_CHECK = k/2*Speed_Elec + Speed_Elec-l/2;
+
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        index_counter += 1;
+                        i++;
+                    }
+                }
+
+                l++;
+            }
+            k++;
+        }
+
+        for (int k = 1; k < n_Electrons; k++)
+        {
+            for (int l = 1; l < k+1; l++)
+            {
+                INDEX_CHECK = k/2*Speed_Elec + Speed_Elec-l/2;
+
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        index_counter += 1;
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            index_counter += 1;
+                            e++;
+                        }
+                        i++;
+                    }
+
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        for (int j = i+2; j < n_Electrons; j++)
+                        {
+                            index_counter += 1;
+                            j++;
+                        }
+                        i++;
+                    }
+                }
+                l++;
+            }
+
+            for (int l = k+2; l < n_Electrons; l++)
+            {
+                INDEX_CHECK = k/2*Speed_Elec + Speed_Elec-l/2;
+
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        index_counter += 1;
+                        i++;
+                    }
+                }
+                l++;
+            }
+            k++;
+        }
+
+
+
+
+
+
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+
+
+            for (int a = 0; a < unocc_orb; a++)
+            {
+                for (int m = 0; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = a/2*Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            index_counter += 1;
+                            e++;
+                        }
+
+                        for (int i = 0; i < n_Electrons; i++)
+                        {
+                            for (int j = i+2; j < n_Electrons; j++)
+                            {
+                                index_counter += 1;
+                                j++;
+                            }
+                            i++;
+                        }
+                    }
+                    m++;
+                }
+                a++;
+            }
+
+            for (int a = 1; a < unocc_orb; a++)
+            {
+                for (int m = 1; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = a/2*Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            index_counter += 1;
+                            e++;
+                        }
+
+                        for (int i = 0; i < n_Electrons; i++)
+                        {
+                            for (int j = i+2; j < n_Electrons; j++)
+                            {
+                                index_counter += 1;
+                                j++;
+                            }
+                            i++;
+                        }
+
+                        for (int i = 1; i < n_Electrons; i++)
+                        {
+                            for (int j = i+2; j < n_Electrons; j++)
+                            {
+                                index_counter += 1;
+                                j++;
+                            }
+                            i++;
+                        }
+                    }
+                    m++;
+                }
+                a++;
+            }
+
+            for (int a = 1; a < unocc_orb; a++)
+            {
+                for (int m = 0; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = a/2*Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            index_counter += 1;
+                            e++;
+                        }
+
+                        for (int i = 0; i < n_Electrons; i++)
+                        {
+                            for (int j = i+1; j < n_Electrons; j++)
+                            {
+                                index_counter += 1;
+                                j++;
+                            }
+                            i++;
+                        }
+
+                        for (int i = 1; i < n_Electrons; i++)
+                        {
+                            for (int j = i+1; j < n_Electrons; j++)
+                            {
+                                index_counter += 1;
+                                j++;
+                            }
+                            i++;
+                        }
+                    }
+                    m++;
+                }
+                a++;
+            }
+
+            for (int a = 0; a < unocc_orb; a++)
+            {
+                for (int m = 1; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = a/2*Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            index_counter += 1;
+                            e++;
+                        }
+
+
+                        for (int i = 0; i < n_Electrons; i++)
+                        {
+                            for (int j = i+1; j < n_Electrons; j++)
+                            {
+                                index_counter += 1;
+                                j++;
+                            }
+                            i++;
+                        }
+
+                        for (int i = 1; i < n_Electrons; i++)
+                        {
+                            for (int j = i+1; j < n_Electrons; j++)
+                            {
+                                index_counter += 1;
+                                j++;
+                            }
+                            i++;
+                        }
+                    }
+                    m++;
+                }
+                a++;
+            }
+
+
+            for (int e = 0; e < unocc_orb; e++)
+            {
+                for (int m = 0; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = e/2*Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        for (int i = 0; i < n_Electrons; i++)
+                        {
+                            index_counter += 1;
+                            i++;
+                        }
+                    }
+                    m++;
+                }
+            }
+
+            for (int e = 0; e < unocc_orb; e++)
+            {
+                for (int m = 1; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = e/2*Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        for (int i = 1; i < n_Electrons; i++)
+                        {
+                            index_counter += 1;
+                            i++;
+                        }
+                    }
+                    m++;
+                }
+            }
+
+            for (int e = 0; e < unocc_orb; e++)
+            {
+                for (int m = 0; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = e/2 * Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        index_counter += 1;
+                        for (int a = 0; a < unocc_orb; a++)
+                        {
+                            index_counter += 1;
+                            a++;
+                        }
+                    }
+                    m++;
+                }
+                e++;
+            }
+
+            for (int e = 0; e < unocc_orb; e++)
+            {
+                for (int m = 1; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = e/2 * Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        for (int a = 0; a < unocc_orb; a++)
+                        {
+                            index_counter += 1;
+                            a++;
+                        }
+                    }
+                    m++;
+                }
+                e++;
+            }
+
+            for (int e = 1; e < unocc_orb; e++)
+            {
+                for (int m = 0; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = e/2 * Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        for (int a = 1; a < unocc_orb; a++)
+                        {
+                            index_counter += 1;
+                            a++;
+                        }
+                    }
+                    m++;
+                }
+                e++;
+            }
+
+            for (int e = 1; e < unocc_orb; e++)
+            {
+                for (int m = 1; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = e/2 * Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        index_counter += 1;
+                        for (int a = 1; a < unocc_orb; a++)
+                        {
+                            index_counter += 1;
+                            a++;
+                        }
+                    }
+                    m++;
+                }
+                e++;
+            }
+
+
+
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+        ////////// T_1_new here ///////////////
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+        ///////////////////////////////////////
+
+
+            for (int a = 0; a < unocc_orb; a++)
+            {
+                for (int k = 0; k < n_Electrons; k++)
+                {
+                    INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - k/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        for (int i = 0; i < k; i++)
+                        {
+                            index_counter += 1;
+                            i++;
+                        }
+
+                        // i will be less than k when k = odd number
+                        // We want i to be an even number since a is even number, hence we start at i = k+1
+                        for (int i = (k+1+(k+1)%2); i < n_Electrons; i++)
+                        {
+                            index_counter += 1;
+                            i++;
+                        }
+                    }
+                }
+                a++;
+            }
+
+            for (int a = 1; a < unocc_orb; a++)
+            {
+                for (int k = 0; k < n_Electrons; k++)
+                {
+                    INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - k/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        for (int i = 1; i < k; i++)
+                        {
+                            index_counter += 1;
+                            i++;
+                        }
+
+                        for (int i = k+1+(k)%2; i < n_Electrons; i++)
+                        {
+                            index_counter += 1;
+                            i++;
+                        }
+                    }
+                }
+                a++;
+            }
+
+
+
+
+
+            if (rank == 0)
+            {
+                cout << "Work: " << index_counter << " for node: " << K << endl;
+            }
+
+
+
+
+
+
+
+
+            ///////////////////////////////////////
+            ///////////////////////////////////////
+            ///////////////////////////////////////
+            ///////////////////////////////////////
+            ////////// W_4 here ///////////////////
+            ///////////////////////////////////////
+            ///////////////////////////////////////
+            ///////////////////////////////////////
+            ///////////////////////////////////////
+
+            index_counter2 = 0;
+
+            for (int a = 0; a < unocc_orb; a++)
+            {
+                for (int m = 0; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            for(int i = 0; i < n_Electrons; i++)
+                            {
+                                index_counter2 += 1;
+                                i++;
+                            }
+                            e++;
+                        }
+                    }
+                    m++;
+                }
+                a++;
+            }
+
+            for (int a = 1; a < unocc_orb; a++)
+            {
+                for (int m = 0; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            for (int i = 1; i < n_Electrons; i++)
+                            {
+                                index_counter2 += 1;
+                                i++;
+                            }
+                            e++;
+                        }
+
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            for (int i = 0; i < n_Electrons; i++)
+                            {
+                                index_counter2 += 1;
+                                i++;
+                            }
+                            e++;
+                        }
+                    }
+                    m++;
+                }
+                a++;
+            }
+
+            for (int a = 0; a < unocc_orb; a++)
+            {
+                for (int m = 1; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            for (int i = 1; i < n_Electrons; i++)
+                            {
+                                index_counter2 += 1;
+                                i++;
+                            }
+                            e++;
+                        }
+
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            for (int i = 0; i < n_Electrons; i++)
+                            {
+                                index_counter2 += 1;
+                                i++;
+                            }
+                            e++;
+                        }
+                    }
+                    m++;
+                }
+                a++;
+            }
+
+            for (int a = 1; a < unocc_orb; a++)
+            {
+                for (int m = 1; m < n_Electrons; m++)
+                {
+                    INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - m/2;
+                    if (INDEX_CHECK % size == K)
+                    {
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            for (int i = 0; i < n_Electrons; i++)
+                            {
+                                index_counter2 += 1;
+                                i++;
+                            }
+                            e++;
+                        }
+
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            for (int i = 1; i < n_Electrons; i++)
+                            {
+                                index_counter2 += 1;
+                                i++;
+                            }
+                            e++;
+                        }
+                    }
+                    m++;
+                }
+                a++;
+            }
+
+            if (rank == 0)
+            {
+                //cout << "Work per node part 2: " << index_counter2 << " for rank " << K << endl;
+            }
+
+
+        WORK_EACH_NODE_Part1(K) = index_counter;
+        WORK_EACH_NODE_Part2(K) = index_counter2;
+
+        if (index_counter2 > index_counter)
+        {
+            index_counter = index_counter2;
+        }
+
+        Part1_MPI[K] = (double*)malloc(index_counter * sizeof(double));
+    }
+}
+
+void CCSD_Memory_optimized::Distribute_Part1()
+{
+    int K, L, E, I, J;
+    double temp;
+
+    int index_counter;
+    int INDEX_CHECK;
+
+    for (int X = 0; X < size; X++)
+    {
+        index_counter = 0;
+
+        K = 0;
+        for (int k = 0; k < n_Electrons; k++)
+        {
+            L = 0;
+            for (int l = 1; l < k; l++)
+            {
+
+                INDEX_CHECK = K*Speed_Elec+Speed_Elec-L;
+                if (INDEX_CHECK % size == X)
+                {
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        D2(K,i/2) += Part1_MPI[X][index_counter];
+                        i++;
+                        index_counter += 1;
+                    }
+
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        E = 0;
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            W_3(i,k)(E+Speed_Occ,L) = Part1_MPI[X][index_counter];
+                            e++;
+                            E++;
+                            index_counter += 1;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    I = 0;
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        E = 0;
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            W_3(i,k)(E,L) = Part1_MPI[X][index_counter];
+                            e++;
+                            E++;
+                            index_counter += 1;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        J = I;
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+                            temp = Part1_MPI[X][index_counter];
+
+                            W_1(i,j)(K,L) += temp;
+                            W_1(i,j)(L+Speed_Elec,K) -= temp;
+                            index_counter += 1;
+                            j++;
+                            J++;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    I = 0;
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        J = I+1;
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+                            temp = Part1_MPI[X][index_counter];
+
+                            W_1(i,j)(K,L) += temp;
+                            W_1(i,j)(L+Speed_Elec,K) -= temp;
+                            index_counter += 1;
+                            j++;
+                            J++;
+                        }
+                        i++;
+                        I++;
+                    }
+                }
+                l++;
+                L++;
+            }
+
+            for (int l = k+1; l < n_Electrons; l++)
+            {
+                INDEX_CHECK = K*Speed_Elec+Speed_Elec-L;
+                if (INDEX_CHECK % size == X)
+                {
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        D2.at(K,i/2) -= Part1_MPI[X][index_counter];
+                        i++;
+                        index_counter += 1;
+                    }
+
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        E = 0;
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            W_3(i,k)(E+Speed_Occ,L) = -W_3(i,l)(E,K);
+                            e++;
+                            E++;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    // NEW
+                    I = 0;
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        E = 0;
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            W_3(i,k)(E,L) = -W_3(i,l)(E,K);
+                            e++;
+                            E++;
+                        }
+                        i++;
+                        I++;
+                    }
+                }
+
+                l++;
+                L++;
+            }
+            k++;
+            K++;
+        }
+
+        K = 0;
+        for (int k = 1; k < n_Electrons; k++)
+        {
+            L = 0;
+            for (int l = 0; l < k; l++)
+            {
+
+                INDEX_CHECK = K*Speed_Elec+Speed_Elec-L;
+                if (INDEX_CHECK % size == X)
+                {
+
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        D2(K+Speed_Elec,i/2) += Part1_MPI[X][index_counter];
+                        i++;
+                        index_counter += 1;
+                    }
+
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        E = 0;
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            W_3(i,k)(E,L) = Part1_MPI[X][index_counter];
+                            e++;
+                            E++;
+                            index_counter += 1;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    I = 0;
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        E = 0;
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            W_3(i,k)(E,L) = Part1_MPI[X][index_counter];
+                            e++;
+                            E++;
+                            index_counter += 1;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        J = I;
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+                            temp = Part1_MPI[X][index_counter];
+
+                            W_1(i,j)(K+Speed_Elec,L) += temp;
+                            W_1(i,j)(L,K) -= temp;
+                            j++;
+                            J++;
+                            index_counter += 1;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    I = 0;
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        J = I+1;
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+                            temp = Part1_MPI[X][index_counter];
+
+                            W_1(i,j)(K+Speed_Elec,L) += temp;
+                            W_1(i,j)(L,K) -= temp;
+                            j++;
+                            index_counter += 1;
+                            J++;
+                        }
+                        i++;
+                        I++;
+                    }
+                }
+                L++;
+                l++;
+            }
+
+            for (int l = k+1; l < n_Electrons; l++)
+            {
+
+                INDEX_CHECK = K*Speed_Elec+Speed_Elec-L;
+                if (INDEX_CHECK % size == X)
+                {
+
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        D2.at(K+Speed_Elec,i/2) -= Part1_MPI[X][index_counter];
+                        i++;
+                        index_counter += 1;
+                    }
+
+                    I = 0;
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        E = 0;
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            W_3(i,k)(E,L) = -W_3(i,l)(E,K);
+                            e++;
+                            E++;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        E = 0;
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            W_3(i,k)(E,L) = -W_3(i,l)(E+Speed_Occ,K);
+                            e++;
+                            E++;
+                        }
+                        i++;
+                        I++;
+                    }
+                }
+
+                l++;
+                L++;
+            }
+            k++;
+            K++;
+        }
+
+        K = 0;
+        for (int k = 0; k < n_Electrons; k++)
+        {
+            L = 0;
+            for (int l = 0; l < k+1; l++)
+            {
+
+                INDEX_CHECK = K*Speed_Elec+Speed_Elec-L;
+                if (INDEX_CHECK % size == X)
+                {
+
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        D2.at(K,i/2) += Part1_MPI[X][index_counter];
+                        i++;
+                        index_counter += 1;
+                    }
+
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        E = 0;
+                        for (int e = 0; e < unocc_orb; e++)
+                        {
+                            W_3(i,k)(E,L) = Part1_MPI[X][index_counter];
+                            W_3(i,l)(E,K) = -W_3(i,k)(E,L);
+                            index_counter += 1;
+                            e++;
+                            E++;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        J = I+1;
+                        for (int j = i+2; j < n_Electrons; j++)
+                        {
+                            temp = Part1_MPI[X][index_counter];
+
+                            W_1(i,j)(K,L) += temp;
+                            W_1(i,j)(L,K) -= temp;
+                            index_counter += 1;
+                            j++;
+                            J++;
+                        }
+                        i++;
+                        I++;
+                    }
+                }
+
+                l++;
+                L++;
+            }
+
+            for (int l = k+2; l < n_Electrons; l++)
+            {
+                INDEX_CHECK = K*Speed_Elec+Speed_Elec-L;
+                if (INDEX_CHECK % size == X)
+                {
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        D2.at(K,i/2) -= Part1_MPI[X][index_counter];
+                        i++;
+                        index_counter += 1;
+                    }
+                }
+
+                l++;
+                L++;
+            }
+            k++;
+            K++;
+        }
+
+        K = 0;
+        for (int k = 1; k < n_Electrons; k++)
+        {
+            L = 0;
+            for (int l = 1; l < k+1; l++)
+            {
+                INDEX_CHECK = K*Speed_Elec+Speed_Elec-L;
+                if (INDEX_CHECK % size == X)
+                {
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        D2.at(K+Speed_Elec,i/2) += Part1_MPI[X][index_counter];
+                        i++;
+                        index_counter += 1;
+                    }
+
+                    I = 0;
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        E = 0;
+                        for (int e = 1; e < unocc_orb; e++)
+                        {
+                            W_3(i,k)(E+Speed_Occ,L) = Part1_MPI[X][index_counter];
+                            W_3(i,l)(E+Speed_Occ,K) = -W_3(i,k)(E+Speed_Occ,L);
+                            e++;
+                            E++;
+                            index_counter += 1;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    I = 0;
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        J = I+1;
+                        for (int j = i+2; j < n_Electrons; j++)
+                        {
+                            temp = Part1_MPI[X][index_counter];
+
+                            W_1(i,j)(K+Speed_Elec,L) += temp;
+                            W_1(i,j)(L+Speed_Elec,K) -= temp;
+
+                            index_counter += 1;
+                            j++;
+                            J++;
+                        }
+                        i++;
+                        I++;
+                    }
+                }
+                l++;
+                L++;
+            }
+
+            for (int l = k+2; l < n_Electrons; l++)
+            {
+                INDEX_CHECK = K*Speed_Elec+Speed_Elec-L;
+                if (INDEX_CHECK % size == X)
+                {
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        D2.at(K+Speed_Elec,i/2) -= Part1_MPI[X][index_counter];
+                        i++;
+                        index_counter += 1;
+                    }
+                }
+
+                l++;
+                L++;
+            }
+            k++;
+            K++;
+        }
+
+
+
+
+
+
+
+        ////////////////////////////////////
+        ////////////////////////////////////
+        ///7////////////////////////////////
+        /// W_2 PART HERE! /////////////////
+        ////////////////////////////////////
+        ////////////////////////////////////
+        ////////////////////////////////////
+
+        int A, M;
+
+        // Optimized W_2 version
+        A = 0;
+        for (int a = 0; a < unocc_orb; a++)
+        {
+            M = 0;
+            for (int m = 0; m < n_Electrons; m++)
+            {
+                INDEX_CHECK = a/2*Speed_Elec + Speed_Elec - m/2;
+                if (INDEX_CHECK % size == X)
+                {
+                    for (int e = 0; e < unocc_orb; e++)
+                    {
+                        D3(a, e/2) += Part1_MPI[X][index_counter];
+                        e++;
+                        index_counter += 1;
+                    }
+
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        J = I+1;
+                        for (int j = i+2; j < n_Electrons; j++)
+                        {
+                            W_2(i,j)(A,M) += Part1_MPI[X][index_counter];
+                            index_counter += 1;
+                            j++;
+                            J++;
+                        }
+                        i++;
+                        I++;
+                    }
+                }
+
+                m++;
+                M++;
+            }
+            a++;
+            A++;
+        }
+
+        A = 0;
+        for (int a = 1; a < unocc_orb; a++)
+        {
+            M = 0;
+            for (int m = 1; m < n_Electrons; m++)
+            {
+                INDEX_CHECK = a/2*Speed_Elec + Speed_Elec - m/2;
+                if (INDEX_CHECK % size == X)
+                {
+                    for (int e = 1; e < unocc_orb; e++)
+                    {
+                        D3(a, e/2) += Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        e++;
+                    }
+
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        J = I+1;
+                        for (int j = i+2; j < n_Electrons; j++)
+                        {
+
+                            W_2(i,j)(A+Speed_Occ,M) += Part1_MPI[X][index_counter];
+                            index_counter += 1;
+                            j++;
+                            J++;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    I = 0;
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        J = I+1;
+                        for (int j = i+2; j < n_Electrons; j++)
+                        {
+
+                            W_2(i,j)(A+Speed_Occ,M) += Part1_MPI[X][index_counter];
+                            index_counter += 1;
+                            j++;
+                            J++;
+                        }
+                        i++;
+                        I++;
+                    }
+                }
+                M++;
+                m++;
+            }
+            a++;
+            A++;
+        }
+
+        A = 0;
+        for (int a = 1; a < unocc_orb; a++)
+        {
+            M = 0;
+            for (int m = 0; m < n_Electrons; m++)
+            {
+                INDEX_CHECK = a/2*Speed_Elec + Speed_Elec - m/2;
+
+                if (INDEX_CHECK % size == X)
+                {
+                    for (int e = 1; e < unocc_orb; e++)
+                    {
+                        D3(a, e/2) += Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        e++;
+                    }
+
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        J = I;
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+
+                            W_2(i,j)(A+Speed_Occ,M) += Part1_MPI[X][index_counter];
+                            index_counter += 1;
+                            j++;
+                            J++;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    I = 0;
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        J = I+1;
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+
+                            W_2(i,j)(A+Speed_Occ,M) += Part1_MPI[X][index_counter];
+                            index_counter += 1;
+                            j++;
+                            J++;
+                        }
+                        i++;
+                        I++;
+                    }
+                }
+
+                m++;
+                M++;
+            }
+            a++;
+            A++;
+        }
+
+        A = 0;
+        for (int a = 0; a < unocc_orb; a++)
+        {
+            M = 0;
+            for (int m = 1; m < n_Electrons; m++)
+            {
+                INDEX_CHECK = a/2*Speed_Elec + Speed_Elec - m/2;
+                if (INDEX_CHECK % size == X)
+                {
+                    for (int e = 0; e < unocc_orb; e++)
+                    {
+                        D3(a,e/2) += Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        e++;
+                    }
+
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        J = I;
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+
+                            W_2(i,j)(A,M) += Part1_MPI[X][index_counter];
+                            index_counter += 1;
+                            j++;
+                            J++;
+                        }
+                        i++;
+                        I++;
+                    }
+
+                    I = 0;
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        J = I+1;
+                        for (int j = i+1; j < n_Electrons; j++)
+                        {
+
+                            W_2(i,j)(A,M) += Part1_MPI[X][index_counter];
+                            index_counter += 1;
+                            j++;
+                            J++;
+                        }
+                        i++;
+                        I++;
+                    }
+                }
+                m++;
+                M++;
+            }
+            a++;
+            A++;
+        }
+
+
+        ////////////////////////////////////
+        ////////////////////////////////////
+        ///7////////////////////////////////
+        /// W_2 PART ENDING HERE! //////////
+        ////////////////////////////////////
+        ////////////////////////////////////
+        ////////////////////////////////////
+
+
+        ////////////////////////////////////
+        ////////////////////////////////////
+        ////////////////////////////////////
+        ////////////////////////////////////
+        ////////////////////////////////////
+        /// Add F2 and F3 parts here ///////
+        ////////////////////////////////////
+        ////////////////////////////////////
+        ////////////////////////////////////
+        ////////////////////////////////////
+        ////////////////////////////////////
+
+
+        for (int e = 0; e < unocc_orb; e++)
+        {
+            M = 0;
+            for (int m = 0; m < n_Electrons; m++)
+            {
+                INDEX_CHECK = e/2*Speed_Elec + Speed_Elec - M;
+                if (INDEX_CHECK % size == X)
+                {
+                    I = 0;
+                    for (int i = 0; i < n_Electrons; i++)
+                    {
+                        D2(M,I) += Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        i++;
+                        I++;
+                    }
+                }
+                m++;
+                M++;
+            }
+        }
+
+        for (int e = 0; e < unocc_orb; e++)
+        {
+            M = 0;
+            for (int m = 1; m < n_Electrons; m++)
+            {
+                INDEX_CHECK = e/2*Speed_Elec + Speed_Elec - M;
+                if (INDEX_CHECK % size == X)
+                {
+                    I = 0;
+                    for (int i = 1; i < n_Electrons; i++)
+                    {
+                        D2(M+Speed_Elec,I) += Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        i++;
+                        I++;
+                    }
+                }
+                m++;
+                M++;
+            }
+        }
+
+        for (int e = 0; e < unocc_orb; e++)
+        {
+            for (int m = 0; m < n_Electrons; m++)
+            {
+                INDEX_CHECK = e/2 * Speed_Elec + Speed_Elec - m/2;
+                if (INDEX_CHECK % size == X)
+                {
+                    D1(e/2, m/2) += Part1_MPI[X][index_counter];
+                    index_counter += 1;
+
+                    for (int a = 0; a < unocc_orb; a++)
+                    {
+                        D3.at(a,e/2) -= Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        a++;
+                    }
+                }
+                m++;
+            }
+            e++;
+        }
+
+        for (int e = 0; e < unocc_orb; e++)
+        {
+            for (int m = 1; m < n_Electrons; m++)
+            {
+                INDEX_CHECK = e/2 * Speed_Elec + Speed_Elec - m/2;
+                if (INDEX_CHECK % size == X)
+                {
+                    for (int a = 0; a < unocc_orb; a++)
+                    {
+                        D3.at(a,e/2) -= Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        a++;
+                    }
+                }
+                m++;
+            }
+            e++;
+        }
+
+        for (int e = 1; e < unocc_orb; e++)
+        {
+            for (int m = 0; m < n_Electrons; m++)
+            {
+                INDEX_CHECK = e/2 * Speed_Elec + Speed_Elec - m/2;
+                if (INDEX_CHECK % size == X)
+                {
+                    for (int a = 1; a < unocc_orb; a++)
+                    {
+                        D3.at(a,e/2) -= Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        a++;
+                    }
+                }
+                m++;
+            }
+            e++;
+        }
+
+        for (int e = 1; e < unocc_orb; e++)
+        {
+            for (int m = 1; m < n_Electrons; m++)
+            {
+                INDEX_CHECK = e/2 * Speed_Elec + Speed_Elec - m/2;
+                if (INDEX_CHECK % size == X)
+                {
+                    D1(e/2+Speed_Occ, m/2) += Part1_MPI[X][index_counter];
+                    index_counter += 1;
+
+                    for (int a = 1; a < unocc_orb; a++)
+                    {
+                        D3.at(a,e/2) -= Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        a++;
+                    }
+                }
+                m++;
+            }
+            e++;
+        }
+
+        ////////////////////////////////////
+        ////////////////////////////////////
+        ///7////////////////////////////////
+        /// T_1_new here! //////////////////
+        ////////////////////////////////////
+        ////////////////////////////////////
+        ////////////////////////////////////
+
+        for (int a = 0; a < unocc_orb; a++)
+        {
+            for (int k = 0; k < n_Electrons; k++)
+            {
+                INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - k/2;
+                if (INDEX_CHECK % size == X)
+                {
+                    for (int i = 0; i < k; i++)
+                    {
+                        T_1_new(a/2, i/2) += Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        i++;
+                    }
+
+                    // i will be less than k when k = odd number
+                    // We want i to be an even number since a is even number, hence we start at i = k+1
+                    for (int i = (k+1+(k+1)%2); i < n_Electrons; i++)
+                    {
+                        T_1_new(a/2, i/2) += Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        i++;
+                    }
+                }
+            }
+            a++;
+        }
+
+        for (int a = 1; a < unocc_orb; a++)
+        {
+            for (int k = 0; k < n_Electrons; k++)
+            {
+                INDEX_CHECK = a/2 * Speed_Elec + Speed_Elec - k/2;
+                if (INDEX_CHECK % size == X)
+                {
+                    for (int i = 1; i < k; i++)
+                    {
+                        T_1_new(a/2+Speed_Occ, i/2) += Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        i++;
+                    }
+
+                    // i will be less than k when k = even number
+                    // We want i to be an odd number since a is an odd number, hence we start at i = k+1
+                    for (int i = k+1+(k)%2; i < n_Electrons; i++)
+                    {
+                        T_1_new(a/2+Speed_Occ, i/2) += Part1_MPI[X][index_counter];
+                        index_counter += 1;
+                        i++;
+                    }
+                }
+            }
+            a++;
+        }
+
+
+    }
+}
+
+void CCSD_Memory_optimized::Fill_integ2_2D_even_even(int a, int i)
+{
+    int B,J;
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ2_2D(B,J) = -MOLeftovers(a/2, b/2)(j/2, i/2)+MOLeftovers(a/2, b/2)(i/2, j/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ2_2D(B+Speed_Occ,J) = MOLeftovers(a/2, b/2)(i/2, j/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+}
+
+void CCSD_Memory_optimized::Fill_integ2_2D_even_odd(int a, int i)
+{
+
+    int B,J;
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ2_2D(B,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ2_2D(B+Speed_Occ,J) = -MOLeftovers(a/2, b/2)(j/2, i/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+}
+
+void CCSD_Memory_optimized::Fill_integ2_2D_odd_even(int a, int i)
+{
+    int B,J;
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ2_2D(B,J) = -MOLeftovers(a/2, b/2)(j/2, i/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ2_2D(B+Speed_Occ,J) = 0;
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+}
+
+void CCSD_Memory_optimized::Fill_integ2_2D_odd_odd(int a, int i)
+{
+    int B,J;
+        B = 0;
+        for (int b = 0; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 0; j < n_Electrons; j++)
+            {
+                integ2_2D(B,J) = MOLeftovers(a/2, b/2)(i/2, j/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+        B = 0;
+        for (int b = 1; b < unocc_orb; b++)
+        {
+            J = 0;
+            for (int j = 1; j < n_Electrons; j++)
+            {
+                integ2_2D(B+Speed_Occ,J) = MOLeftovers(a/2, b/2)(i/2, j/2) - MOLeftovers(a/2, b/2)(j/2,i/2);
+                j++;
+                J++;
+            }
+            b++;
+            B++;
+        }
+
+}
+
+// Big program

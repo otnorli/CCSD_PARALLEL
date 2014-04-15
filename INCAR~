@@ -1,0 +1,12 @@
+Basis_Set STO-3G
+Method CCSD
+convergance_criteria -8.0
+Relax_Pos false
+use_angstrom false
+print_stuffies true
+
+O 0 0 0
+H 0 1.079252 1.474611
+H 0 1.079252 -1.47611
+
+

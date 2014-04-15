@@ -1,6 +1,6 @@
 #include "hartree_fock_solver.h"
 
-Hartree_Fock_Solver::Hartree_Fock_Solver(int n_N, vec zz, mat rr, string B_s, int n_elec, bool pstf)
+Hartree_Fock_Solver::Hartree_Fock_Solver(int n_N, vec zz, mat rr, string B_s, int n_elec, bool pstf, int ran, int siz)
 {
     n_Nuclei = n_N;
     Z = zz;
@@ -8,6 +8,111 @@ Hartree_Fock_Solver::Hartree_Fock_Solver(int n_N, vec zz, mat rr, string B_s, in
     Basis_Set = B_s;
     n_Electrons = n_elec;
     print_stuff = pstf;
+    rank = ran;
+    size = siz;
+}
+
+void Hartree_Fock_Solver::Map_MPI()
+{
+    // Complete MPI here
+    // Variable Fock_MPI scales like n^3, where n is number of Contracted GTOs
+    // This is necasary because we want indexes (i) and (j) to be seperated, and also we need to swap k and m,
+    // but we can remove one of the indexes due to row and col use later
+
+    WORK_PER_NODE = zeros(size);
+    Fock_MPI = (double**) malloc(size * sizeof(double *));
+
+    int index_counter;
+    int INDEX_CHECK;
+
+    for (int K = 0 ; K < size; K++)
+    {
+        index_counter = 0;
+
+        for (int i = 0; i < Matrix_Size; i++)
+        {
+            for (int k = 0; k < Matrix_Size; k++)
+            {
+                INDEX_CHECK = i+k;
+                if (INDEX_CHECK % size == K)
+                {
+                    for (int j = 0; j < Matrix_Size; j++)
+                    {
+                        index_counter += 1;
+                    }
+                }
+            }
+        }
+
+        WORK_PER_NODE(K) = index_counter;
+        Fock_MPI[K] = (double*) malloc(index_counter * sizeof(double));
+    }
+}
+
+double Hartree_Fock_Solver::Calc_Integrals_On_The_Fly(int orb1, int orb3, int orb2, int orb4)
+{
+    // This functions calculates our two electron integrals on the fly
+    // Input is indexes, where the indexes orb1, orb2 etc range from 0 -> Number of Contracted GTOs
+
+    int i,j,k,m;
+
+    // Here we find which atom the index belongs to, this is needed in calculations of 2 electron integrals
+    i = Calc_Which_Atom_We_Are_Dealing_With(orb1);
+    j = Calc_Which_Atom_We_Are_Dealing_With(orb3);
+    k = Calc_Which_Atom_We_Are_Dealing_With(orb2);
+    m = Calc_Which_Atom_We_Are_Dealing_With(orb4);
+
+    // Here we calculate the two electron integrals, we have already stored E_ij^t so they are quite fast.
+    // Symmetry considerations must be applied elsewhere.
+
+    int E_counter1, E_counter2; // These ensures we get the right E_ij^t
+    int n,p,o,q;
+    double temp = 0;
+    E_counter1 = E_index(orb1,orb2);
+    for (n=0; n<n_Basis(orb1); n++)
+    {
+        for (p=0; p<n_Basis(orb2); p++)
+        {
+            E_counter2 = E_index(orb3, orb4);
+            for (o=0; o<n_Basis(orb3); o++)
+            {
+                for (q=0; q<n_Basis(orb4); q++)
+                {
+                    temp += c(orb1,n)*c(orb2,p)*c(orb3,o)*c(orb4,q)*
+                            HartInt.Electron_Electron_Interaction_Single(orb1, orb3, orb2, orb4,
+                                                                            i, j, k, m,
+                                                                            n, o, p, q,
+                                                                            E_counter1, E_counter2);
+
+
+                    E_counter2 += 3;
+                }
+            }
+            E_counter1 += 3;
+        }
+    }
+    return temp;
+}
+
+int Hartree_Fock_Solver::Calc_Which_Atom_We_Are_Dealing_With(int orb1)
+{
+    int atom = -1;
+    for (int i = 0; i < n_Nuclei; i++)
+    {
+        for (int j = 0; j < Number_Of_Orbitals(i); j++)
+        {
+            atom++;
+            if (atom == orb1)
+            {
+                return i;
+            }
+        }
+    }
+}
+
+mat Hartree_Fock_Solver::Return_Field_Q(int i, int j)
+{
+    return field_Q(i,j);
 }
 
 mat Hartree_Fock_Solver::ReturnC()
@@ -333,47 +438,81 @@ double Hartree_Fock_Solver::Calc_Density()
 
 double Hartree_Fock_Solver::Calc_Energy()
 {
-    double Energy=0;
-
-    Two_E_Energy = 0;
+    // Effective energy calculations
     Single_E_Energy = accu(EK % P);
-    for (int i=0; i<Matrix_Size; i++)
-    {
-        for (int j=0; j<Matrix_Size; j++)
-        {
-            for (int k=0; k<Matrix_Size; k++)
-            {
-                for (int m=0; m<Matrix_Size; m++)
-                {
-                    Two_E_Energy += 0.5*P(i,j)*P(m,k)*(Stored_Indexed_Q(Get_Integral_Index(i,j,k,m)) - 0.5*Stored_Indexed_Q(Get_Integral_Index(i,m,k,j)));
-                }
-            }
-        }
-    }
-
-    Energy = Single_E_Energy + Two_E_Energy;
-    return Energy;
+    Two_E_Energy = 0.5*accu(Energy_Fock_Matrix % P) - 0.5*Single_E_Energy;
+    return Single_E_Energy+Two_E_Energy;
 }
 
 double Hartree_Fock_Solver::Make_Fock_Matrix()
 {
     F = EK;
+
+    // This must run in parallel, since we only want to store a few of the integrals on each node
+    // In fact we are as of now not using the symmetries in the Atomic Orbitals
+
+    int index_counter = 0;
+    int work;
+    int INDEX_CHECK;
+    //vec Vec1 = zeros(Matrix_Size);
+    //vec Vec2 = zeros(Matrix_Size);
+
     for (int i=0; i<Matrix_Size; i++)
     {
-        for (int j=0; j<Matrix_Size; j++)
+        for (int k=0; k<Matrix_Size; k++)
         {
-            //F(i,j) = EK(i,j);
+            INDEX_CHECK = i+k;
 
-            for (int k=0; k<Matrix_Size; k++)
+            if (INDEX_CHECK % size == rank)
             {
-                for (int m=0; m<Matrix_Size; m++)
+                for (int j=0; j< Matrix_Size; j++)
                 {
-                    F(i,j) += P(m,k)*(Stored_Indexed_Q(Get_Integral_Index(i,j,k,m)) - 0.5 * Stored_Indexed_Q(Get_Integral_Index(i,m,k,j)));
+                    // Use this for on the fly calculations, currently we store n^4 / M^2, where M = number processors
+                    //for (int m = 0; m < Matrix_Size; m++)
+                    //{
+                        //Vec1(m) = Calc_Integrals_On_The_Fly(i,k,j,m);
+                        //Vec2(m) = Calc_Integrals_On_The_Fly(i,k,m,j);
+                    //}
+
+                    Fock_MPI[rank][index_counter] = accu(P.col(k) % (field_Q(i,k).row(j) - 0.5*field_Q(i,k).col(j).t()));
+                    //Fock_MPI[rank][index_counter] = accu(P.col(k) % ( Vec1.t() - 0.5 * Vec2.t())); // This is for calculations on the fly :-D slightly ineffective
+                    index_counter += 1;
                 }
             }
         }
     }
 
+    for (int X = 0; X < size; X++)
+    {
+        work = WORK_PER_NODE(X);
+        MPI_Bcast(Fock_MPI[X], work, MPI_DOUBLE, X, MPI_COMM_WORLD);
+    }
+
+    for (int X = 0; X < size; X++)
+    {
+        index_counter = 0;
+        for (int i=0; i<Matrix_Size; i++)
+        {
+            for (int k=0; k<Matrix_Size; k++)
+            {
+                INDEX_CHECK = i+k;
+
+                if (INDEX_CHECK % size == X)
+                {
+                    for (int j=0; j<Matrix_Size; j++)
+                    {
+                        F(i,j) += Fock_MPI[X][index_counter];
+                        index_counter += 1;
+                    }
+                }
+            }
+        }
+    }
+
+
+
+    // Not parallel anymore
+    Energy_Fock_Matrix = F;
     DIIS();
     F = V.t() * F * V;
 
@@ -388,9 +527,6 @@ double Hartree_Fock_Solver::get_Energy(double toler)
 
     // Dummie variabler vi kommer til å trenge underveis
     int i,j,k;
-    //int t;
-    int E_counter1 = 0;
-    int E_counter2 = 0;
     double Energy;
     double NucleiRepulsion;
     int orb1=-1, orb2, orb3, orb4, at1, at2, at3, at4, m,n,o,p,q;
@@ -400,7 +536,12 @@ double Hartree_Fock_Solver::get_Energy(double toler)
     // Fyller opp initialbetingelsene. Alt dette er input og vi fyller det inn med to klasser foreløpig, siden det er masse tall bare
     matrix_size_setter matset(Z, Basis_Set, n_Nuclei);
     Matrix_Size = matset.Set_Matrix_Size();
-    cout << "Number of orbitals for CCSD: " << 2*Matrix_Size << endl;
+
+    if (print_stuff == true)
+    {
+        cout << "Number of orbitals for CCSD: " << 2*Matrix_Size << endl;
+    }
+
     Fill_Alpha Fyll(n_Nuclei, Z, Basis_Set, Matrix_Size, matset.Return_Max_Bas_Func());
     alpha = Fyll.Fyll_Opp_Alpha();
     c = Fyll.Fyll_Opp_c();
@@ -408,6 +549,22 @@ double Hartree_Fock_Solver::get_Energy(double toler)
     Number_Of_Orbitals = Fyll.Fyll_Opp_Antall_Orbitaler();
     Potenser = Fyll.Fyll_Opp_Potenser();
     Stored_Indexed_Q = zeros(Get_Integral_Index(Matrix_Size-1, Matrix_Size-1, Matrix_Size-1, Matrix_Size-1) + 1); // Compact storage
+
+
+    // For parallel implementation we do this:
+
+    field_Q.set_size(Matrix_Size, Matrix_Size);
+    for (int i = 0; i < Matrix_Size; i++)
+    {
+        for (int j = 0; j < Matrix_Size; j++)
+        {
+            if ((i+j)%size == rank)
+            {
+                field_Q(i,j) = zeros(Matrix_Size, Matrix_Size);
+            }
+        }
+    }
+
 
     // Deklarerer matrisene med data vi kommer til å lagre under beregningene. Kunne lagret mindre men velger dette foreløpig
     EK = zeros(Matrix_Size, Matrix_Size); // Skal inneholde kinetisk energi og elektron-kjerne interaksjon
@@ -420,13 +577,14 @@ double Hartree_Fock_Solver::get_Energy(double toler)
     //Indexed_Q = zeros(ijkl);
 
     Normalize_small_c();
+    Map_MPI();
 
-    // Alle beregningene på integraler skjer i dette objektet
-    Hartree_Integrals HartInt(n_Nuclei, n_Basis, R, Z, alpha, Matrix_Size, c, Number_Of_Orbitals, Potenser, n_Electrons);
+    // Alle beregningene på integraler skjer i dette objektet, som er et globalt objekt
+    //Hartree_Integrals HartInt();
+    HartInt.Set_Input(alpha, Matrix_Size, c, Number_Of_Orbitals, Potenser, n_Basis, n_Nuclei, R, Z, n_Electrons);
 
     // Gjør litt pre-work, for å effektivisere beregningene
     HartInt.Fill_E_ij();
-    HartInt.Set_Boys_Start(30);
 
     if (print_stuff)
     {
@@ -456,11 +614,13 @@ double Hartree_Fock_Solver::get_Energy(double toler)
     //cube temp_cube = zeros(Matrix_Size, Matrix_Size, Matrix_Size);
     //for (int i = 0; i < Matrix_Size; i++)
     //{
-        //return_Q.push_back(temp_cube);
+    //    return_Q.push_back(temp_cube);
     //}
 
+
+    // Calc Q not on the fly here, which can be used for small systems
     orb1 = -1;
-    mat E_index = HartInt.get_E_index();
+    E_index = HartInt.get_E_index();
     double temp;
 
     for (i=0; i<n_Nuclei; i++) // Looper over alle atomene først
@@ -475,8 +635,8 @@ double Hartree_Fock_Solver::get_Energy(double toler)
         {
             orb2 += 1;
 
-            if (orb1 <= orb2) // symetri test 1
-            {
+            //if (orb1 <= orb2) // symetri test 1
+           // {
 
                 orb3 = -1;
                 for (j=0; j<n_Nuclei; j++)
@@ -485,7 +645,9 @@ double Hartree_Fock_Solver::get_Energy(double toler)
                 {
                 orb3 += 1;
 
-                if (orb1 <= orb3) // symetri test 2
+                if ((orb1+orb3)%size == rank)
+                {
+                if (orb1 <= orb3)
                 {
                     orb4 = -1;
 
@@ -495,95 +657,64 @@ double Hartree_Fock_Solver::get_Energy(double toler)
                     {
                     orb4 += 1;
 
-                    if (orb3 <= orb4) // symetri test 3
-                    {
+                    //if (orb3 <= orb4) // symetri test 3
+                    //{
 
-                        E_counter1 = E_index(orb1,orb2);
+                        //temp = 0;
 
-                        temp = 0;
+                        //if (Stored_Indexed_Q(Get_Integral_Index(orb1, orb2, orb3, orb4)) == 0)
+                        //{
+                        temp = Calc_Integrals_On_The_Fly(orb1, orb3, orb2, orb4);
 
-                        if (Stored_Indexed_Q(Get_Integral_Index(orb1, orb2, orb3, orb4)) == 0)
-                        {
-                            // Må loope over alle mulige comboer av basiser
-                            for (n=0; n<n_Basis(orb1); n++)
-                            {
-                                for (p=0; p<n_Basis(orb2); p++)
-                                {
-                                    E_counter2 = E_index(orb3, orb4);
-                                    for (o=0; o<n_Basis(orb3); o++)
-                                    {
-                                        for (q=0; q<n_Basis(orb4); q++)
-                                        {
-                                            temp += c(orb1,n)*c(orb2,p)*c(orb3,o)*c(orb4,q)*
-                                                    HartInt.Electron_Electron_Interaction_Single(orb1, orb3, orb2, orb4,
-                                                                                                    i, j, k, m,
-                                                                                                    n, o, p, q,
-                                                                                                    E_counter1, E_counter2);
 
-                                            E_counter2 += 3;
-                                        }
-                                    }
-                                    E_counter1 += 3;
-                                }
-                            }
 
-                            /*
-                             * These symmetries must hold here and also cause our symmetries later in the MOs (integ in CCSD):
-                             *
-                             * kvantefysform !_! orb_nr form
-                             * <uv||pq> !_! <13|24>
-                             * <vu||pq> !_! <31|24>
-                             * <uv||qp> !_! <13|42>
-                             * <vu||qp> !_! <31|42>
-                             *
-                             * <qp||uv> !_! <42|13>
-                             * <pq||vu> !_! <24|31>
-                             * <qp||vu> !_! <42|31>
-                             * <pq||uv> !_! <24|13>
-                             *
-                             * In this program they are implemented with a flip of indicies to accomodate physics/chemical notation
-                             * which is (physics: <12|34>) = chemist: ([13|24])
-                             *
-                             * The flip is done to ensure we can use the stored E(...) in the same order as prior, such that E_counter is correct
-                             */
+
+                            // * These symmetries must hold here and also cause our symmetries later in the MOs (integ in CCSD):
+                            // *
+                            // * kvantefysform !_! orb_nr form
+                            // *
+                            // *
+                            // * <uv|pq>      !_! <13|24>
+                            // * <vu|pq>      !_! <31|24>
+                            // * <uv|qp>      !_! <13|42>
+                            // * <vu|qp>      !_! <31|42>
+                            // *
+                            // * <qp|uv>      !_! <42|13>
+                            // * <pq|vu>      !_! <24|31>
+                            // * <qp|vu>      !_! <42|31>
+                            // * <pq|uv>      !_! <24|13>
+                             //*
+                            // * In this program they are implemented with a flip of indicies to accomodate physics/chemical notation
+                            // * which is (physics: <12|34>) = chemist: ([13|24])
+                            // *
+                             //* The flip is done to ensure we can use the stored E(...) in the same order as prior, such that E_counter is correct
+
 
                             Stored_Indexed_Q(Get_Integral_Index(orb1, orb2, orb3, orb4)) = temp; // <-- PHYSICS NOTATION
-                        }
-
-                        /*
-                          //This way (inside this comment section) of storing <ab|ij> is now obsolete with the improved method of Stored_Indexed_Q
-                          //However it is kept in comment so if you are reading this, Stored_Indexed_Q does the exact
-                          //same as would these 8 lines, it is a compact way of storing these values considering the symmetries
-
-                          //Also hopefully it will explain why we pass orb1, orb3, orb2, orb4, in that order into the function
-                          //Electron_Electron_Interaction_Single.
-
-                          //The method is known as Compact Indicies
-
-                          // Code:
-                        return_Q.at(orb1)(orb3,orb2,orb4) = temp; // <-- CHEMIST NOTATION, FLIPPED INDICIES ORB2 AND ORB3!
-                        return_Q.at(orb1)(orb4,orb2,orb3) = temp;
-
-                        return_Q.at(orb2)(orb3,orb1,orb4) = temp;
-                        return_Q.at(orb2)(orb4,orb1,orb3) = temp;
-
-                        return_Q.at(orb3)(orb1,orb4,orb2) = temp;
-                        return_Q.at(orb3)(orb2,orb4,orb1) = temp;
-
-                        return_Q.at(orb4)(orb1,orb3,orb2) = temp;
-                        return_Q.at(orb4)(orb2,orb3,orb1) = temp;
-                          // Code end
-                        */
+                        //}
 
 
-                       } // if test 3
+
+                        field_Q(orb1,orb3)(orb2,orb4) = temp; // <-- CHEMIST NOTATION, FLIPPED INDICIES ORB2 AND ORB3!
+                        //field_Q(orb1,orb4)(orb2,orb3) = temp;
+
+                        //field_Q(orb2,orb3)(orb1,orb4) = temp;
+                        //field_Q(orb2,orb4)(orb1,orb3) = temp;
+
+                        //field_Q(orb3,orb2)(orb4,orb1) = temp;
+                        field_Q(orb3,orb1)(orb4,orb2) = temp;
+
+                        //field_Q(orb4,orb2)(orb3,orb1) = temp;
+                        //field_Q(orb4,orb1)(orb3,orb2) = temp;
+                      // } // if test 3
                     }
                     }
                 } // if test 2
 
                 }
                 }
-            } // if test 1
+            //} // if test
+                }
         }
         }
     }
@@ -594,7 +725,6 @@ double Hartree_Fock_Solver::get_Energy(double toler)
         cout << "Q done!" << endl;
     }
 
-    HartInt.Delete_Everything();
 
     // Kjører Hartree Fock
     bool run_HF = true;
@@ -753,6 +883,7 @@ void Hartree_Fock_Solver::Initialize_DIIS()
 
 void Hartree_Fock_Solver::Delete_Everything()
 {
+    // Clear everything, this is kinda crazeh
     Stored_Indexed_Q.clear();
     Stored_Error.clear();
     Stored_F.clear();
@@ -777,10 +908,11 @@ void Hartree_Fock_Solver::Delete_Everything()
     V.clear();
     alpha.clear();
     Potenser.clear();
+    HartInt.Delete_Everything();
 }
 
 void Hartree_Fock_Solver::Unrestricted_Fock_Matrix()
-{
+{/*
     // Unfinished implementation of unrestricted HF
     F_up = EK;
     F_down = EK;
@@ -804,6 +936,7 @@ void Hartree_Fock_Solver::Unrestricted_Fock_Matrix()
     }
     F_up = V.t() * F_up * V;
     F_down = V.t() * F_down * V;
+    */
 }
 
 void Hartree_Fock_Solver::Unrestricted_P_Matrix()

@@ -7,25 +7,27 @@ SOURCES += main.cpp \
     hartree_integrals.cpp \
     matrix_size_setter.cpp \
     fill_alpha.cpp \
-    coupled_cluster_integrals.cpp \
-    relax_the_structure.cpp \
-    diis.cpp \
     initializer.cpp \
-    coupled_cluster_v2.cpp \
-    ccsd_memory_optimized.cpp \
-    ccsd_v2_optimized.cpp
+    ccsd_memory_optimized.cpp
 
-LIBS += -llapack -lblas
+LIBS += -llapack -lblas -lmpi
 
 HEADERS += \
     hartree_fock_solver.h \
     hartree_integrals.h \
     matrix_size_setter.h \
     fill_alpha.h \
-    coupled_cluster_integrals.h \
-    relax_the_structure.h \
-    diis.h \
     initializer.h \
-    coupled_cluster_v2.h \
-    ccsd_memory_optimized.h \
-    ccsd_v2_optimized.h
+    ccsd_memory_optimized.h
+
+# MPI Settings
+QMAKE_CXX = mpicxx
+QMAKE_CXX_RELEASE = $$QMAKE_CXX
+QMAKE_CXX_DEBUG = $$QMAKE_CXX
+QMAKE_LINK = $$QMAKE_CXX
+QMAKE_CC = mpicc
+
+QMAKE_CFLAGS += $$system(mpicc --showme:compile)
+QMAKE_LFLAGS += $$system(mpicxx --showme:link)
+QMAKE_CXXFLAGS += $$system(mpicxx --showme:compile) -DMPICH_IGNORE_CXX_SEEK
+QMAKE_CXXFLAGS_RELEASE += $$system(mpicxx --showme:compile) -DMPICH_IGNORE_CXX_SEEK

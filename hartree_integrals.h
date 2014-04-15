@@ -13,10 +13,11 @@ using namespace arma;
 class Hartree_Integrals
 {
 public:
-    Hartree_Integrals(int n_N, vec n_B, mat pos, vec zZz, mat alp, int n_tot_bf, mat cc, vec n_O, mat pot, int n_E);
+    Hartree_Integrals();
     int n_Nuclei, Matrix_Size, n_Electrons;
     vec n_Basis, n_Orbitals, Z;
     mat alpha, c, R, Potenser, Ek, O;
+    void Set_Input(mat alp, int n_tot_bf, mat cc, vec n_O, mat pot, vec n_B, int n_N, mat pos, vec zZz, int n_E);
 
     // Overlap
     mat Overlap_Matrix();
@@ -35,11 +36,14 @@ public:
     double Nuclei_Electron_Interaction_Single(int ind1, int ind2, int a1, int a2, int bas1, int bas2, int E_counter);
     double Nuclei_Electron_Interaction_Single_1d(double p, int t, int u, int v, rowvec R1, rowvec R2, double n);
     double Boys(double x, double n);
+    double A_function(double n, double input);
+    double Gamma_Function(double n, double input);
     double Boys_Start;
     int Boys_N;
     vec F_Boys;
     int Double_Factorial(int TALL);
     void Set_Boys_Start(int N);
+    int Factorial(int N);
 
 
     // Nuclei-Nuclei repulsion
