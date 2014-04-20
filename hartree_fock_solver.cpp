@@ -586,6 +586,7 @@ double Hartree_Fock_Solver::get_Energy(double toler)
 
     // Gjør litt pre-work, for å effektivisere beregningene
     HartInt.Fill_E_ij();
+    HartInt.Set_Boys_Start((max(max(Potenser))+1)*4);
 
     if (print_stuff)
     {

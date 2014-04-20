@@ -20,6 +20,25 @@ double CCSD_Memory_optimized::CCSD(double toler, bool print_stuff)
      * *Optimization thoughts for programmer:
      *
      *
+     *          A MAJOR CHANGE IN PARALLEL IMPLEMENTATION COMMING!
+     *
+     *          WE SHOULD DEFINE T2_NEW AND PART1_MPI AS TWO ONE DIMENSIONAL ARRAYS OF SIZE = MAX NR OF WORK OF ANY OF THE NODES
+     *          THEN EACH OF THE NODES HAVE TWO ARRAYS, ONE OF WHICH IS THEIR WORK, THE OTHER CONTAINS THE WORK RECIEVED
+     *          THEN THERE IS ONE COMMUNICATION AND THIS IS MAPPED
+     *
+     *          => THEN THE TEMP MPI ARRAY's CONTENT IS REPLACED BY NEXT NODES WORK AND THIS IS DISTRIBUTED
+     *
+     *          THIS REDUCE LEADING TERM STORAGE REQUIRED TO EXACTLY (1 + 1/16) * n_v^2 n_o^2
+     *
+     *          IF THIS IS NOT GOOD ENOUGH WE MUST STORE SOME MOs ON HARDDISK - CURRENTLY THEY ARE DISTRIBUTED
+     *
+     *
+     *
+     *          Current optimizations should then (after the rest) be aimed at the NON ITERATIVE part of CCSD,
+     *          HF is fast enough for systems that CCSD can handle, iterations will be very fast, pre-work can and will be further optimized, see Prepear_MOs function
+     *
+     *
+     *
      *
      *          W_4 and W_2 is called depending upon a and b, meaning we can utilize this and only calculate the a and b that we need for each node
      *          in the already parallel t2_new calculation. May cause some aditional calculations, but it is possible
@@ -80,11 +99,11 @@ double CCSD_Memory_optimized::CCSD(double toler, bool print_stuff)
     // SIZE OF INTEGRAL (MO) STORAGE //
     ///////////////////////////////////
 
-    // We store the following integrals:            // Solution to storage problems:
-    // MO9          // 1/32 n_u^2*(n_o+n_u)^2       // Distributed
-    // MO10         // 1/16 n_u*n_o*(n_o+n_u)^2     // Distributed
-    // MO6          // 1/32 n_o^2*(n_o+n_u)^2       // Possible to distribute in parallel implementation
-    // MOLeftovers  // 1/32 n_o^2 n_u^2             // Hard to distribute in parallel implementation, but smallest part of MOs, but possible
+    // We store the following integrals (not updated):  // Solution to storage problems:
+    // MO9          // 1/32 n_u^2*(n_o+n_u)^2           // Distributed
+    // MO10         // 1/16 n_u*n_o*(n_o+n_u)^2         // Distributed
+    // MO6          // 1/32 n_o^2*(n_o+n_u)^2           // Possible to distribute in parallel implementation
+    // MOLeftovers  // 1/32 n_o^2 n_u^2                 // Hard to distribute in parallel implementation, but smallest part of MOs, but possible
 
     // Define variables used in the CCSD method:
 
@@ -92,12 +111,12 @@ double CCSD_Memory_optimized::CCSD(double toler, bool print_stuff)
     tau3.set_size(n_Electrons, n_Electrons); // 1/4 n_o^2 n_u^2 // Use this for hyperspeed, can be removed if memoryproblems
 
     // Optimized 4D arrays
-    t2.set_size(unocc_orb, n_Electrons);    // 1/4 n_o^2 n_u^2     // Must be stored!
+    t2.set_size(unocc_orb, n_Electrons);    // 1/4 n_o^2 n_u^2     // Must be stored!, check size again
     // t2_new is replaced by a double**     // 1/16 n_o^2 n_u^2
     W_1.set_size(n_Electrons, n_Electrons); // 1/4 n_o^4        // Relatively small
     W_2.set_size(n_Electrons, n_Electrons); // 1/4 n_o^3 n_u    // Relatively small
     W_3.set_size(n_Electrons, n_Electrons); // 3/8 n_o^3 n_u    // Relatively small
-    W_4.set_size(unocc_orb, n_Electrons);   // 1/2 n_o^2 n_u^2    // Big tits
+    W_4.set_size(unocc_orb, n_Electrons);   // 1/2 n_o^2 n_u^2    // Biggest variable
 
     // In total we end up storing the following leading terms of MOs (updated 28.04.13, somewhat different now, mostly smaller):
     // n_u^4         1/32           =  0.03
@@ -1943,17 +1962,19 @@ void CCSD_Memory_optimized::Fill_t2_new()
 
                 if (INDEX_CHECK % size == rank)
                 {
-
                     Fill_integ3_2D(a, b);
                     Fill_integ9_2D(a, b);
                     Fill_2D_tau(a, b);
-
+/*
                     for (int i = 0; i < n_Electrons; i++) // i even
                     {
                         for (int j = i+2; j < n_Electrons; j++) // j even
                         {
+
+                            // This state illigal according to UN resolution 203
+
                             // I_ab^ij
-                            T2_MPI[rank][index_counter] = 0 // integ2.at(b,j)(a/2+Speed_Occ,i/2)
+                            T2_MPI[rank][index_counter] = 0 ;// integ2.at(b,j)(a/2+Speed_Occ,i/2)
 
                             // P(ab) P(ij) [W_4] t_jk^bc, ARMADILLO
                                     + accu(t2.at(b,j) % W_4.at(a,i))
@@ -1977,7 +1998,7 @@ void CCSD_Memory_optimized::Fill_t2_new()
 
                             // P(ij) I_ab^cj t_i^c, ARMADILLO
                                     - accu(integ9_2D(span(0, Speed_Occ-1), i/2) % T_1(span(0, Speed_Occ-1), j/2))
-                                    + accu(integ9_2D(span(0, Speed_Occ-1), j/2) % T_1(span(0, Speed_Occ-1), i/2))
+                                   + accu(integ9_2D(span(0, Speed_Occ-1), j/2) % T_1(span(0, Speed_Occ-1), i/2))
 
                             // 0.5 I_ab^cd tau
                                     + 0.5*accu(integ3_2D(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span()) % tau3(i,j)(span(Speed_Occ, Speed_Occ+Speed_Occ-1), span())); // Half matrix = 0, skip this
@@ -1987,7 +2008,7 @@ void CCSD_Memory_optimized::Fill_t2_new()
                         }
                         i++;
                     }
-
+*/
                     for (int i = 1; i < n_Electrons; i++) // i odd
                     {
                         for (int j = i+2; j < n_Electrons; j++) // j odd
@@ -2386,6 +2407,7 @@ void CCSD_Memory_optimized::Map_T_new()
 
                 if (INDEX_CHECK % size == K)
                 {
+                    /*
                     for (int i = 0; i < n_Electrons; i++) // i even
                     {
                         for (int j = i+2; j < n_Electrons; j++) // j even
@@ -2402,7 +2424,7 @@ void CCSD_Memory_optimized::Map_T_new()
                         }
                         i++;
                     }
-
+*/
                     for (int i = 1; i < n_Electrons; i++) // i odd
                     {
                         for (int j = i+2; j < n_Electrons; j++) // j odd
@@ -2652,6 +2674,7 @@ void CCSD_Memory_optimized::Prepear_AOs()
     int send_size = matsize * matsize;
     double *send_matrix_MPI = (double*) malloc(matsize*matsize*sizeof(double));
     mat recieve_matrix = zeros(matsize, matsize);
+    cube send_cube = zeros(matsize, matsize, matsize);
 
     for (int a = 0; a < Speed_Elec; a++)
     {
@@ -2675,6 +2698,8 @@ void CCSD_Memory_optimized::Prepear_AOs()
                     }
                 }
 
+                // THIS COMMUNICATION MUST BE MOVED TO AFTER THE TRANSFORMATION AO -> MO!
+                // THIS WILL BE VERY BIG SPEEDUP
                 MPI_Bcast(send_matrix_MPI, send_size, MPI_DOUBLE, SENDER, MPI_COMM_WORLD);
 
                 index_counter = 0;
@@ -2746,6 +2771,8 @@ void CCSD_Memory_optimized::Prepear_AOs()
             }
         }
 
+
+        // HERE THE COMMUNICATION SHOULD BE PLACED!
 
             for (int i = a; i < Speed_Elec; i++)
             {
@@ -4210,7 +4237,7 @@ void CCSD_Memory_optimized::Map_T2_For_MPI()
 
                 if (INDEX_CHECK % size == K)
                 {
-
+/*
                     for (int i = 0; i < n_Electrons; i++)
                     {
                         for (int j = i+2; j < n_Electrons; j++)
@@ -4220,7 +4247,7 @@ void CCSD_Memory_optimized::Map_T2_For_MPI()
                             j++;
                         }
                         i++;
-                    }
+                    }*/
 
                     for (int i = 1; i < n_Electrons; i++)
                     {

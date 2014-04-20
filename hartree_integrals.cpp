@@ -616,7 +616,10 @@ double Hartree_Integrals::Nuclei_Electron_Interaction_Single_1d(double p, int t,
 double Hartree_Integrals::Boys(double x, double n)
 {
    double F;
-   int N = (n+2)*15;//Boys_N;
+   //int N = (2*n+1)*15;//Boys_N;
+   //int N = Boys_N;
+   //N = 50;
+   int N = 30;
    F_Boys = zeros(N+1);
    double exp_term = exp(-x);
 
