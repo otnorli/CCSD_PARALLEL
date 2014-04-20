@@ -14,32 +14,6 @@ Program not 100% complete, still in the works.
 
 Program is probably hard to get to work right now, as input can bug in meny meny ways. But it will be much easier soon. User friendliness will be good.
 
-Program uses Armadillo and MPI. No OpenMP or any of that. Please supply blas and lapack also somehow. Input is given in a file you name "INCAR". In this file you write:
+Program uses Armadillo and MPI. No OpenMP or any of that. Please supply blas and lapack also somehow. Input is given in a file you name "INCAR". 
 
-\#ATOMS BEGIN
-
-then list a bunch of atoms, like 
-
-O 0 0 0
-
-H 1 0 0
- etc
-
-and then \#ATOMS END
-
-also add a few lines about stuff like
-Basis_Set STO-3G
-Method CCSD
-use_angstrom true
-convergance_criteria -8.0
-
-If you want to change basis set you can use for example 4-31G, STO-3G, 6-311-2d2p or 6-311ss. Not all atoms implemented for all these basis sets jet, but soon.
-
-The only important thing is that you have \#ATOMS START and \#ATOMS END and in the middle you have the chemical symbol for the grunnstoff you wish to study, O for oxygen, H for hydrogen etc, and then you have the coordinates x y z with one space in between them. Or else you will get bug. Can give input in main.cpp also if you edit some code. 
-
-Output will be printed if print_stuffies is set to true.
-Ångstrøm is used if use_angstrom is set to true
-relax_pos does not work jet, set it false
-convergance_criteria is given as the power of 10, for example -8.0 is 10^(-8.0) convergance criteria
-Method can be CCSD or HF currently
-Basis_Set are listed above
+Here supply convergence criteria, Bohr og angstrom, atom positions and atom names etc. Description and examples comming soon.
