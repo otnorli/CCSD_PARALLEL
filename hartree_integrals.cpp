@@ -619,12 +619,15 @@ double Hartree_Integrals::Boys(double x, double n)
    //int N = (2*n+1)*15;//Boys_N;
    //int N = Boys_N;
    //N = 50;
-   int N = 30;
-   F_Boys = zeros(N+1);
+   //int N = 30;
+   int N;
+
    double exp_term = exp(-x);
 
    if (x > 50)
    {
+       N = 12;
+       F_Boys = zeros(N+1);
        Set_Boys_Start(N);
 
        F = Boys_Start / pow(2.0, N+1) * sqrt(M_PI/pow(x, 2*N+1));
@@ -632,10 +635,12 @@ double Hartree_Integrals::Boys(double x, double n)
 
    else
    {
+       N = 12;
+       F_Boys = zeros(N+1);
        F = 0;
        double sum=0;
        int M;
-       for (int j=0; j<40; j++)
+       for (int j=0; j<100; j++)
        {
            sum = pow(2*x, j);
            M = 2*N+1;

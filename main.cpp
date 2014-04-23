@@ -302,9 +302,9 @@ int main()
     //Basis_Set = "STO-3G";
     //Basis_Set = "3-21G";
     //Basis_Set = "4-31G";
-    //Basis_Set = "cc-pVDZ";
-    //Basis_Set = "cc-pVTZ";
+    //Basis_Set = "6-311ss";
     //Basis_Set = "6-311-2d2p";
+
 
     // Pick method
     //Method = "CCSD";
@@ -312,7 +312,6 @@ int main()
 */
     // Choose some extras, none of which works jet
     //Relax_Pos = false;
-    bool Big_Tit_Run = false;
     //use_angstrom = false;
     //print_stuffies = true;
 
@@ -349,11 +348,10 @@ int main()
         double x;
         double n;
 
-        x = 57.1625;
-        n = 1;
+        x = 44.8960;
+        n = 3;
 
         cout << (HartInt.Boys(x, n)) << endl;
-
     }
 
     // Finalize

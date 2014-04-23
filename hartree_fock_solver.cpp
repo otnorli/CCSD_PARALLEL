@@ -514,7 +514,7 @@ double Hartree_Fock_Solver::Make_Fock_Matrix()
 
     // Not parallel anymore
     Energy_Fock_Matrix = F;
-    DIIS();
+    //DIIS();
     F = V.t() * F * V;
 
     return 0;

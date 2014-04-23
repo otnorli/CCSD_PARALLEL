@@ -130,7 +130,7 @@ int matrix_size_setter::Set_Matrix_Size()
                 }
             }
 
-            if (Z(i) == 4)
+            if (Z(i) == 4 || Z(i) == 5)
             {
                 value += 5;
                 if (max_bas_func < 3)
@@ -158,7 +158,7 @@ int matrix_size_setter::Set_Matrix_Size()
                 }
             }
 
-            if (Z(i) == 8)
+            if (Z(i) == 8 || Z(i) == 9)
             {
                 value += 5;
                 if (max_bas_func < 3)
