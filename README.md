@@ -1,3 +1,5 @@
+program should be bug free now , CCSD part is all good. 
+
 RHF CCSD USING CLOSED SHELL GAUSSIAN TYPE ORBITALS FROM EMSL BASIS SET EXCHANGE - PROGRAM WRITTEN USING QTCREATOR
 
 CCSDTQ program in "cc_general.cpp", it works with a different version of Hartree Fock and is not 100% completed jet, but uploaded still. Big program.
