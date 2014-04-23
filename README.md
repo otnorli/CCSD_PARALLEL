@@ -6,7 +6,7 @@ CCSDTQ program in "cc_general.cpp", it works with a different version of Hartree
 
 Big CCSD program. Very fast! Implemented brand new optimizations never before seen in the human world. 
 
-Should be noted that it currently only works for even number of electrons, but we only need to add a few +1 and -1 around the code for it to work for odd number of electrons, no optimizations exclude odd number of electrons.
+Should be noted that it currently only works for even number of electrons, we use RHF as basis and CCSD will bug for odd nr of electrons due to the fact that 8/2 is same as 9/2 in integer division. need to add some +1 and -1 for CCSD not to give error with odd nr of electrons.
 
 Eggstremely fast program, fastest in the world as far as I know and free to be downloaded by anyone! Feel free to use my code and make whatever changes you want. No need to ask permission. In fact please dont ask my permission.
 
