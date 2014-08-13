@@ -49,7 +49,7 @@ Sets up sizes of arrays we will need.
 
 Additional Comments:
 
-- CCSD Program is the fastest serial program ever developed for smaller systems. Utilize compact storage to effectively dodge all uneccasary calculations and utilize symmetries were they are effective. For further proposed optimizations please see MA thesis "Coupled Cluster Studies in Computational Chemistry" from the Computational Physics Group at the University of Oslo. 
+- CCSD Program is the fastest serial program ever developed. Quite good, but still sub optimal parallel performance. Also some scaling problems with armadillo in combination with MPI. Utilizes newly discovered compact storage to effectively dodge all uneccasary calculations and utilize symmetries were they are effective. For further proposed optimizations please see MA thesis "Coupled Cluster Studies in Computational Chemistry" from the Computational Physics Group at the University of Oslo. 
 
 - Makes use of armadillo and MPI. No other external libraries required.
 
