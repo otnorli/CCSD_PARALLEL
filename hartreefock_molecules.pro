@@ -8,7 +8,10 @@ SOURCES += main.cpp \
     matrix_size_setter.cpp \
     fill_alpha.cpp \
     initializer.cpp \
-    ccsd_memory_optimized.cpp
+    ccsd_memory_optimized.cpp \
+    ccsd_non_iterative_part.cpp \
+    ccsdt.cpp \
+    fill_alpha2.cpp
 
 LIBS += -llapack -lblas -lmpi
 
@@ -18,7 +21,10 @@ HEADERS += \
     matrix_size_setter.h \
     fill_alpha.h \
     initializer.h \
-    ccsd_memory_optimized.h
+    ccsd_memory_optimized.h \
+    ccsd_non_iterative_part.h \
+    ccsdt.h \
+    fill_alpha2.h
 
 # MPI Settings
 QMAKE_CXX = mpicxx

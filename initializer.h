@@ -10,6 +10,7 @@
 #include "hartree_fock_solver.h"
 #include "hartree_integrals.h"
 #include "ccsd_memory_optimized.h"
+#include "ccsdt.h"
 
 using namespace std;
 using namespace arma;
@@ -17,12 +18,13 @@ using namespace arma;
 class Initializer
 {
 public:
-    Initializer(int n_N, int n_E, string B_S, string met, bool r_pos, mat rr, vec zz, double con_crit, int ran, int siz, bool us_ang);
+    Initializer(int n_N, int n_E, string B_S, string met, bool r_pos, mat rr, vec zz, double con_crit, int ran, int siz, bool us_ang, bool frez);
     double Go(bool printie);
 
     int n_Nuclei, n_Electrons;
     double convergance_criteria;
     string Basis_Set, Method;
+    bool frozen_core;
     mat R;
     vec Z;
 

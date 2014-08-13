@@ -45,6 +45,8 @@ public:
     void Set_Boys_Start(int N);
     int Factorial(int N);
 
+    // Boys stuff
+    mat F_tabulated;
 
     // Nuclei-Nuclei repulsion
     double Nuclei_Nuclei_Interaction();
@@ -56,6 +58,7 @@ public:
 
     // Cleanup
     void Delete_Everything();
+    void Fill_F_Tabulated();
 };
 
 #endif // HARTREE_INTEGRALS_H

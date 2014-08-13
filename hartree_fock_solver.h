@@ -8,6 +8,9 @@
 #include "fill_alpha.h"
 #include "hartree_integrals.h"
 #include "mpi.h"
+#include <string>
+#include <time.h>
+#include <fill_alpha2.h>
 
 using namespace std;
 using namespace arma;
@@ -16,12 +19,17 @@ class Hartree_Fock_Solver
 {
 public:
     // Input parametre
-    Hartree_Fock_Solver(int n_N, vec zz, mat rr, string B_s, int n_elec, bool pstf, int ran, int siz);
+    Hartree_Fock_Solver(int n_N, vec zz, mat rr, string B_s, int n_elec, bool pstf, int ran, int siz, bool frezcor);
     int n_Nuclei, steppp;
     vec Z;
     mat R;
     string Basis_Set;
     bool print_stuff;
+    bool Freeze_Core;
+
+    int Calculated_Before;
+    field<mat> Before_Value;
+    bool Just_Changed;
 
     // MPI
     int rank, size;
@@ -45,6 +53,10 @@ public:
     vector<cube> return_Q;
     field<mat> field_Q;
     Hartree_Integrals HartInt;
+
+    void Perform_Core_Freeze();
+
+    field<mat> Return_Frozen_Q;
 
     mat Return_Field_Q(int i, int j);
 
@@ -72,8 +84,9 @@ public:
     double Single_E_Energy;
     double Two_E_Energy;
     double Nuclei_Rep_Energy;
+    void Set_UP_DOWN(int a, int b);
 
-    double get_Energy(double toler);
+    double get_Energy(double toler, int do_uhf);
     vec Normalize(vec Vektorn, mat Matrisen);
     void Set_New_R(mat rr);
 
@@ -91,10 +104,25 @@ public:
     // Spin unrestricted function
     void Unrestricted_Fock_Matrix();
     void Unrestricted_P_Matrix();
-    void Unrestricted_Energy();
+    double Unrestricted_Energy();
     mat F_up, F_down;
+    mat EnF_up, EnF_down;
     mat P_up, P_down;
+    mat C_up, C_down;
+    vec eigenvalues_F_up, eigenvalues_F_down;
+    mat eigenvektors_F_up, eigenvektors_F_down;
+    int elec_up, elec_down;
 
+    // Disk use
+    FILE* fpp;
+    double *buf;
+
+    void Initialize_UHF();
+
+    mat return_C_up();
+    mat return_C_down();
+    vec return_F_up();
+    vec return_F_down();
 
 
 };

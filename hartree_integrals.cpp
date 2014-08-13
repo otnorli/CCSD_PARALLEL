@@ -17,10 +17,12 @@ void Hartree_Integrals::Set_Input(mat alp, int n_tot_bf, mat cc, vec n_O, mat po
     n_Nuclei = n_N;
     Z = zZz;
     n_Electrons = n_E;
+
 }
 
 void Hartree_Integrals::Set_R_ijk(double p, int t, int u, int v, rowvec R1, rowvec R2)
 {
+    // Calculate R_n_ijk
     int t_max;
     int nn,i,j,k;
 
@@ -105,10 +107,19 @@ void Hartree_Integrals::Delete_Everything()
     E_ij.clear();
     F_Boys.clear();
     R_ijk.clear();
+    F_tabulated.clear();
+}
+
+void Hartree_Integrals::Fill_F_Tabulated()
+{
+    // This function is code generated
 }
 
 void Hartree_Integrals::Fill_E_ij()
 {
+    // Fill up E_t^ij for future use. Calculate everything one time in advance
+    // and reuse values in all integrals.
+
     // This is long function, but only called one time during the program.
     // This is the genious of E_counter during the program. It finds the correct E_ij always, even in 2-e calculations
     int max_potens = max(max(Potenser));
@@ -222,6 +233,8 @@ mat Hartree_Integrals::get_E_index()
 
 int Hartree_Integrals::Double_Factorial(int TALL)
 {
+    // Return double factorial
+
     if (TALL == 0)
     {
         return 1;
@@ -250,6 +263,8 @@ int Hartree_Integrals::Double_Factorial(int TALL)
 
 void Hartree_Integrals::Set_Boys_Start(int N)
 {
+    // Factorized out value of Boys function
+
     Boys_N = N;
 
     // Double factorial
@@ -266,6 +281,7 @@ void Hartree_Integrals::Set_Boys_Start(int N)
 
 int Hartree_Integrals::Factorial(int N)
 {
+    // Return Factorial
     int value=1;
     for (int i = 2; i < (N+1); i++)
     {
@@ -276,6 +292,7 @@ int Hartree_Integrals::Factorial(int N)
 
 mat Hartree_Integrals::Overlap_Matrix()
 {
+    // Calculates the overlap integrals and returns matrix
     int k,m;
     int E_counter = 0;
     double sum;
@@ -307,6 +324,8 @@ mat Hartree_Integrals::Overlap_Matrix()
 
 double Hartree_Integrals::Overlap_Integral_Single(int ind1, int ind2, int bas1, int bas2, int E_counter)
 {
+    // Calculates a single overlap integral between two primitives
+
     // Returnerer overlappen mellom to basisfunksjoner
     int A=0, B=0, C=0, D=0, E=0, F=0;
     double value;
@@ -336,6 +355,8 @@ double Hartree_Integrals::Overlap_Integral_Single(int ind1, int ind2, int bas1, 
 
 mat Hartree_Integrals::Kinetic_Energy()
 {
+    // Calculate the kinetic energy integrals.
+
     // Finner kinetic energy termen
     // |psi> er orbitalen vår
     //
@@ -376,6 +397,8 @@ mat Hartree_Integrals::Kinetic_Energy()
 
 double Hartree_Integrals::Kinetic_Energy_Single(int ind1, int ind2, int bas1, int bas2, int E_counter)
 {
+    // Calculate the kinetic energy integral between two primitives
+
     // Her regner vi ut <ABC|(d/dr)^2|DEF>
 
     double x1,x2;
@@ -437,6 +460,8 @@ double Hartree_Integrals::Kinetic_Energy_Single(int ind1, int ind2, int bas1, in
 
 mat Hartree_Integrals::Nuclei_Electron_Interaction()
 {
+    // Calculate the nuclei-electron integral
+
     int i,j,k,m;
     int q,p;
     mat Ne_E_Interaction = zeros(Matrix_Size, Matrix_Size);
@@ -486,6 +511,7 @@ mat Hartree_Integrals::Nuclei_Electron_Interaction()
 
 double Hartree_Integrals::Nuclei_Electron_Interaction_Single(int ind1, int ind2, int a1, int a2, int bas1, int bas2, int E_counter)
 {
+    // Calculate the nuclei-electron integral between two primitives
     double x1,x2;
     x1 = alpha(ind1, bas1);
     x2 = alpha(ind2, bas2);
@@ -530,6 +556,7 @@ double Hartree_Integrals::Nuclei_Electron_Interaction_Single(int ind1, int ind2,
 
 double Hartree_Integrals::Nuclei_Electron_Interaction_Single_1d(double p, int t, int u, int v, rowvec R1, rowvec R2, double n)
 {
+    // Calculate the nuclei-electron integral between two primitives in one dimension
     int t_max;
     int nn,i,j,k;
 
@@ -615,6 +642,7 @@ double Hartree_Integrals::Nuclei_Electron_Interaction_Single_1d(double p, int t,
 
 double Hartree_Integrals::Boys(double x, double n)
 {
+    // Calculate a value for the Boys Fucntion
    double F;
    //int N = (2*n+1)*15;//Boys_N;
    //int N = Boys_N;
@@ -626,7 +654,8 @@ double Hartree_Integrals::Boys(double x, double n)
 
    if (x > 50)
    {
-       N = 12;
+       //N = 46;
+       N = 30;
        F_Boys = zeros(N+1);
        Set_Boys_Start(N);
 
@@ -635,7 +664,7 @@ double Hartree_Integrals::Boys(double x, double n)
 
    else
    {
-       N = 12;
+       N = 30;
        F_Boys = zeros(N+1);
        F = 0;
        double sum=0;
@@ -665,6 +694,8 @@ double Hartree_Integrals::Boys(double x, double n)
 
 double Hartree_Integrals::Nuclei_Nuclei_Interaction()
 {
+    // Calculate nuclei-nuclei interaction. This is constant number.
+
     // Finner nuclei-nuclei interaksjons termen
     // |psi> er bølgefunksjonen vår
     //
@@ -691,9 +722,13 @@ double Hartree_Integrals::Electron_Electron_Interaction_Single(int ind1, int ind
                                                                int bas1, int bas2, int bas3, int bas4,
                                                                int E_counter1, int E_counter2)
 {
+    // Calculate electron-electron interaction integral.
+    // Additional comments included on how we propose to perform this calculation
+    // reusing alpha values from previous calculation.
+
     double x1,x2,x3,x4;
     x1 = alpha(ind1, bas1);
-    x2 = alpha(ind2, bas2);
+    x2 = alpha(ind2, bas2); // These values are shared for orbitals with same alpha values
     x3 = alpha(ind3, bas3);
     x4 = alpha(ind4, bas4);
 
@@ -711,18 +746,22 @@ double Hartree_Integrals::Electron_Electron_Interaction_Single(int ind1, int ind
     B2 = Potenser(ind2,1);
     C2 = Potenser(ind2,2);
     D2 = Potenser(ind4,0);
-    E2 = Potenser(ind4,1);
-    F2 = Potenser(ind4,2);
+    E2 = Potenser(ind4,1); // If we use the implementation comented our in our code
+    F2 = Potenser(ind4,2); // Only D2, E2 and F2 changes with change of orbital with same primitives
 
     double value=0, P, Q, tempvalue;
 
     P = x1+x3;
     Q = x2+x4;
-    RP = (x1*R.row(a1) + x3*R.row(a3))/P;
+    RP = (x1*R.row(a1) + x3*R.row(a3))/P; // These values are constant with same primitives
     RQ = (x2*R.row(a2) + x4*R.row(a4))/Q;
 
     int t1, u1, v1;
     int t2, u2, v2;
+
+    // R_ijk should be set for
+    // Set_R_ijk(P*Q/(P+Q), (A1+D1+A1+(D2 + X )+2), (B1+E1+B2+( E2 + X )+2, (C1+F1+C2+( F2 + X )+2), RP, RQ);
+    // X will be the total angular momentum of the orbital, orb4
 
     Set_R_ijk(P*Q/(P+Q), (A1+D1+A2+D2+2), (B1+E1+B2+E2+2), (C1+F1+C2+F2+2), RP, RQ);
 
@@ -741,12 +780,12 @@ double Hartree_Integrals::Electron_Electron_Interaction_Single(int ind1, int ind
                         {
                             tempvalue += pow(-1.0, (t2+u2+v2))
                                     * R_ijk.at(0)((t1+t2), (u1+u2), (v1+v2))
-                                    * E_ij.at(E_counter2)(A2, D2, t2)
-                                    * E_ij.at(E_counter2+1)(B2, E2, u2)
-                                    * E_ij.at(E_counter2+2)(C2, F2, v2);
+                                    * E_ij.at(E_counter2)(A2, D2, t2) // These values changes with changed orbital
+                                    * E_ij.at(E_counter2+1)(B2, E2, u2) // but same primitives
+                                    * E_ij.at(E_counter2+2)(C2, F2, v2); // Can reuse E_counter as before
                         }
                     }
-                }
+                } // This (except tempvalue) is constant with changed orbital but same primitives
                 value += tempvalue * E_ij.at(E_counter1)(A1, D1, t1)* E_ij.at(E_counter1+1)(B1, E1, u1)* E_ij.at(E_counter1+2)(C1, F1, v1);
             }
         }

@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+
 using namespace arma;
 using namespace std;
 
@@ -81,6 +82,7 @@ int return_charge(string Atom_Type);
 
 char *find_and_write(char *fileBuffer, char *substring)
 {
+    // Find keywords in input file, return value after the keyword
         char *ptr;
         int len = 0;
 
@@ -102,6 +104,7 @@ char *find_and_write(char *fileBuffer, char *substring)
 
 char *find_start_of_atoms(char *fileBuffer)
 {
+    // Find where atom input starts
     // NEED "#ATOMS START" as a line in the INCAR file
     char *substring = "#ATOMS START";
     char *ptr;
@@ -204,21 +207,22 @@ void Fill_One_Atom(char**fileBuffer, one_atom *atom1)
     }
 }
 
+// CHRISTOFFERS FUNCTION!!!!!!!
+//void runForOmegas(int F, list<string> omegas);
 
-int main()
+
+int main(int argc, char**argv)
 {
     // Definerer noen variabler, ikke bry deg om at de er veldig rare:
     int n_Nuclei=5000,/* redefined later */ n_Electrons; bool Test_Ongoing, Relax_Pos;
     string Basis_Set, Method; double Energy, convergance_criteria;
     vec Z = zeros(n_Nuclei); mat R = zeros(n_Nuclei, 3); // redefined later
-    clock_t start = clock(); bool print_stuffies; one_atom ATOMM;
+    clock_t start; bool print_stuffies; one_atom ATOMM; bool frozen_core;
     clock_t slutt; int rank, size; bool use_angstrom; int i;
     ATOMM.CHECK_NEXT = 1; // This is used to check if there are more atoms, this way we dont have to define how meny atoms we are using in input file
     // This is done to simplify input
 
     // Gogo MPI
-    int argc;
-    char **argv;
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
@@ -252,6 +256,12 @@ int main()
         // Get Convergance Criteria
         retval = find_and_write(buff, "convergance_criteria");
         convergance_criteria = pow(10.0, atof(retval));
+
+        retval = find_and_write(buff, "Freeze_Core");
+        if (strncmp(retval, "true", 4) == 0)
+          frozen_core = true;
+        else
+          frozen_core = false;
 
         // Get Extras
         retval = find_and_write(buff, "Relax_Pos");
@@ -294,7 +304,7 @@ int main()
 
     // Some general input, which is just basics
     //convergance_criteria = pow(10.0, -8.0); // Criteria at which calculations broken
-    Test_Ongoing = false;
+
 
 /*
     // Pick basis set, can be read from INCAR
@@ -304,6 +314,7 @@ int main()
     //Basis_Set = "4-31G";
     //Basis_Set = "6-311ss";
     //Basis_Set = "6-311-2d2p";
+    //Basis_Set = "6-31G";
 
 
     // Pick method
@@ -317,46 +328,126 @@ int main()
 
     // Input posisjon og ladninger:
     //Z(0) = 10;
+
+
+
+
+
+
 /*
-    Z(0) = 1;
-    Z(1) = 8;
-    Z(2) = 1;
+    int ssr = 1;
 
     R(0,0) = 0;
-    R(0,1) = 1.079252144093028;
-    R(0,2) = 1.474611055780858;
-    R(2,0) = 0;
-    R(2,1) = 1.079252144093028;
-    R(2,2) = -1.474611055780858;
-    R(1,0) = 0;
-    R(1,1) = 0;
+    R(0,1) = 0;
+    R(0,2) = 0;
+
+    R(1,0) = ssr;
+    R(1,1) = sqrt(2)*ssr;
     R(1,2) = 0;
+
+    R(2,0) = sqrt(2)*ssr;
+    R(2,1) = ssr;
+    R(2,2) = 0;
+
+    R(3,0) = -ssr;
+    R(3,1) = -sqrt(2)*ssr;
+    R(3,2) = 0;
+
+    R(4,0) = -sqrt(2)*ssr;
+    R(4,1) = ssr;
+    R(4,2) = 0;
 */
 
     // Input complete, press play.
 
     // Lets go
+    Test_Ongoing = false;
+    start = clock();
+
+
+
     if (Test_Ongoing == false)
     {
-        Initializer Init(n_Nuclei, n_Electrons, Basis_Set, Method, Relax_Pos, R, Z, convergance_criteria, rank, size, use_angstrom);
+        Initializer Init(n_Nuclei, n_Electrons, Basis_Set, Method, Relax_Pos, R, Z, convergance_criteria, rank, size, use_angstrom, frozen_core);
         Energy = Init.Go(print_stuffies);
     }
 
     if (Test_Ongoing == true)
     {
-        Hartree_Integrals HartInt;
-        double x;
-        double n;
+        /*
+        clock_t mm, mmm, kk, kkk;
+        int numb;
+        numb = 50;
 
-        x = 44.8960;
-        n = 3;
+        int* Displacement = (int*)malloc(size * sizeof(int));
+        int* Work = (int*)malloc(size * sizeof(int));
 
-        cout << (HartInt.Boys(x, n)) << endl;
+        int buffer, buffer2;
+        buffer = numb*numb*numb*numb;
+
+        for (int i = 0; i < size; i++)
+        {
+            Displacement[i] = i * buffer;
+            Work[i] = buffer;
+        }
+        buffer2 = buffer*size;
+
+        double* A = (double*)malloc(buffer*sizeof(double));
+        double* C = (double*)malloc(buffer2 * sizeof(double));
+
+        mat B = randu(numb*numb, numb*numb);
+        int k = 0;
+        int J = 0;
+        for (int i = 0; i < numb*numb; i++)
+        {
+            for (int j = 0; j < numb*numb; j++)
+            {
+                if ((int)k/size == rank)
+                {
+                    A[J] = B(i,j);
+                    J++;
+                }
+                A[k] = B(i,j);
+                k++;
+            }
+        }
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        mm = clock();
+
+        for (int k = 0; k < 10; k++)
+        {
+            MPI_Bcast(A, buffer, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        }
+
+        mmm = clock();
+        if (rank == 0)
+        {
+            cout << "Tid 10 x Bcasts = " << (double)(mmm - mm)/CLOCKS_PER_SEC << " s " << endl;
+            cout << "CPUs: " << " " << size << endl;
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        kk = clock();
+        for (int k = 0; k < 10; k++)
+        {
+            MPI_Allgatherv(A, Work[rank], MPI_DOUBLE, C, Work, Displacement, MPI_DOUBLE, MPI_COMM_WORLD);
+        }
+        kkk = clock();
+        if (rank == 0)
+        {
+            cout << "Tid 10 x Allgatherv = " << (double)(kkk - kk)/CLOCKS_PER_SEC << " s " << endl;
+            cout << "CPUs: " << " " << size << endl;
+        }
+*/
     }
 
     // Finalize
     slutt = clock();
+
 /*
+ * We dont want this anymore
+ *
     // We want to write to an output file OUTCAR that will contain our output
     ofstream myfile;
     myfile.open("OUTCAR");
@@ -364,9 +455,37 @@ int main()
     myfile << "Energy: " << Energy << endl;
     myfile.close();
 */
+
     if (print_stuffies == true && rank == 0)
     {
+
         cout << "Tid brukt: " << (double)(slutt - start)/CLOCKS_PER_SEC << "s" << endl;
+
+        // Calculate memory requirements
+
+/*
+        int bf = 300;
+
+        double tot;
+        vec pzz = zeros(10);
+        pzz(0) = 16;pzz(1) = 32;pzz(2) = 64;
+        pzz(3) = 128; pzz(4) = 256;pzz(5) = 512;
+        pzz(6) = 1024;pzz(7) = 2048;pzz(8) = 4096;
+        pzz(9) = 100000;
+        double tempor = (double)bf/569;
+        double scaling_curb = pow(tempor,4.0);
+        double scaling_curb2 = pow(tempor,3.0);
+        double totot =  0.569 * 0.323761;
+        totot *= 8;
+        cout << "AOs: " << bf << endl;
+        for (int i = 0; i < 10; i++)
+        {
+            tot = totot * (1 * scaling_curb2 + scaling_curb*2*(569/2/pzz(i)));
+            cout << "Mem Needs " << pzz(i) << " procs: " << tot << " GB" << endl;
+        }
+        */
+
+
     }
 
     MPI_Finalize();
@@ -375,6 +494,8 @@ int main()
 
 int return_charge(string Atom_Type)
 {
+    // Find charge of atom from input
+    // At the end some of the atoms are marked with wrong charge, should be fixed, occours when Z is approx  80 or more
     if (Atom_Type == "H")
     {
         return 1;
@@ -804,7 +925,7 @@ int return_charge(string Atom_Type)
     }
     else if (Atom_Type == "U")
     {
-        return 107;
+        return 92;
     }
     else if (Atom_Type == "Np")
     {
@@ -852,3 +973,145 @@ int return_charge(string Atom_Type)
     }
 
 }
+
+
+/*
+void runForOmegas(int F, list<string> omegas)
+{
+
+    bool hfbasis = false;
+    bool effective = false;
+    int R = 10;
+
+    stringstream resPath;
+    resPath << "resF" << F << "_";
+    if (effective == true)
+        resPath << "EFF_";
+    else
+        resPath << "STD_";
+    if (hfbasis == true)
+        resPath << "HF/";
+    else
+        resPath << "HO/";
+/*
+    CQDot * sys = NULL;
+    HFsys * hfsys = NULL;
+
+    mat C_succ;
+    mat t1_succ;
+    vector<mat> t2_succ;
+
+    //    CLgemm mmul(0);
+    //    CLstrassen mmul(0);
+    Strassen mmul;
+    //    GEMM mmul;
+
+    HF hf(1e-7, 250);
+    CC ccsd(1e-7, 500);
+    ccsd.store_amplitudes(true);
+    ccsd.set_mult(&mmul);
+
+    while (!omegas.empty())
+    {
+        string omega = omegas.front();
+        cout << "Running for omega = " << omega << endl;
+        omegas.pop_front();
+
+        stringstream tpFname;
+
+
+        //tpFname << "std" << R << "_1.tp";
+        tpFname << "tpElements.dat";
+
+        mat hoMat;
+        // Setting up the HOmatrix
+           hoMat.zeros(R*(R+1),R*(R+1));
+
+
+           ifstream infile;
+
+           int p, q;
+           double element;
+
+           infile.open("hoElements.dat", ios::in);
+
+        while (true) {
+
+            element = 0;
+
+            if (infile.eof())
+                break;
+
+            infile >> p;
+            infile >> q;
+            infile >> element;
+            if (infile.eof())
+                break;
+
+            hoMat(p,q) = element;
+            hoMat(q,p) = element;
+
+        }
+
+        infile.close();
+        if (sys == NULL)
+        {
+            sys = new CQDot(F, R, hoMat);
+            sys->readFileName(tpFname.str());
+        }
+
+        sys->set_omega(atof(omega.c_str()));
+
+        cout << "I am here" << endl;
+        //Hartree-Fock part
+        hf.set_system(sys);
+        if (C_succ.is_empty() == false)
+            hf.set_initial_C_guess(C_succ);
+        try
+        {
+            pair<double, mat> E_C = hf.solve_ground_state_energy(HF::DEBUG_ENERGY);
+            cout << setprecision(10) << E_C.first << endl;
+            cout << "HF SUCC\n";
+            C_succ = E_C.second;
+        } catch (NotConverged e)
+        {
+            cout << "Convergence stopped at omega = " << atof(omega.c_str());
+        cout << endl;
+            break;
+        }
+
+        if (hfbasis == true)
+        {
+            if (hfsys != NULL)
+                delete hfsys;
+            hfsys = new HFsys(sys, C_succ, &mmul);
+            ccsd.set_system(hfsys);
+        } else
+        {
+            ccsd.set_system(sys);
+        }
+
+        try
+        {
+            ccsd.t1_stored = t1_succ;
+            ccsd.t2_stored = t2_succ;
+            cout << ccsd.solve_ground_state_energy(CC::DEBUG_ENERGY) << endl;
+            cout << "CC SUCC\n";
+            ccsd.use_amplitudes(true);
+            t1_succ = ccsd.t1_stored;
+            t2_succ = ccsd.t2_stored;
+        } catch (NotConverged)
+        {
+            cout << "Convergence stopped at omega = " << atof(omega.c_str());
+            break;
+        }
+
+    }
+
+    if (hfsys != NULL)
+        delete hfsys;
+    if (sys != NULL)
+        delete sys;
+
+}
+*/
