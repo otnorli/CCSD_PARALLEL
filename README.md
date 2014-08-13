@@ -1,21 +1,66 @@
-program should be bug free now , CCSD part is all good. 
+Quantum Chemistry Package from Computational Physics Group at University of Oslo.
 
-RHF CCSD USING CLOSED SHELL GAUSSIAN TYPE ORBITALS FROM EMSL BASIS SET EXCHANGE - PROGRAM WRITTEN USING QTCREATOR
+Available Methods:
 
-CCSDTQ program in "cc_general.cpp", it works with a different version of Hartree Fock and is not 100% completed jet, but uploaded still. Big program.
+- UHF, Unstricted Hartree-Fock
+- RHF, Restricted Hartree Fock
+- CCSD, Coupled Cluster Singles and Doubles, with spin restriction
+- CCSDT, Coupled Cluster Singles, Doubles and Triples, with spin restriction
 
-Big CCSD program. Very fast! Implemented brand new optimizations never before seen in the human world. 
+and CCSDT-n Models:
+- CCSDT-1a
+- CCSDT-1b
+- CCSDT-2
+- CCSDT-3
+- CCSDT-4
 
-Should be noted that it currently only works for even number of electrons, we use RHF as basis and CCSD will bug for odd nr of electrons due to the fact that 8/2 is same as 9/2 in integer division. need to add some +1 and -1 for CCSD not to give error with odd nr of electrons.
+Implemented with Cartesian Gaussian Type Orbitals, Cartesian GTOs.
 
-Eggstremely fast program, fastest in the world as far as I know and free to be downloaded by anyone! Feel free to use my code and make whatever changes you want. No need to ask permission. In fact please dont ask my permission.
+Description of classes in alphabetical order:
 
-ccsd_memory_optimized.cpp is the most optimal code. Rest of CCSD classes are stored versions of earlier and less effective code, in both speed and memory terms.
+- cc_general.cpp:
+Unfinished CCSDTQ Method.
 
-Program not 100% complete, still in the works. 
+- ccsd_even.cpp:
+Old version of CCSD program using Compact Storage of arrays.
 
-Program is probably hard to get to work right now, as input can bug in meny meny ways. But it will be much easier soon. User friendliness will be good.
+- coupled_cluster.cpp:
+First implementation of CCSD.
 
-Program uses Armadillo and MPI. No OpenMP or any of that. Please supply blas and lapack also somehow. Input is given in a file you name "INCAR". 
+- fill_alpha.cpp:
+Contains numbers from EMSL for a select number of basis sets.
 
-Here supply convergence criteria, Bohr og angstrom, atom positions and atom names etc. Description and examples comming soon.
+- hartree_fock_solver.cpp:
+Solves the Hartree Fock Equations for RHF and UHF.
+
+- hartree_integrals:
+Solves the Overlap, Kinetic, Nuclei-Electron and Electron-Electron integrals using Cartesian GTOs.
+
+- initializer.cpp:
+Makes use of input to run correct methods with atoms in correct geometries.
+
+- main.cpp:
+Reads input file and sends information to initializer.
+
+- matrix_size_setter:
+Sets up sizes of arrays we will need.
+
+
+
+Additional Comments:
+
+- CCSD Program is the fastest serial program ever developed for smaller systems. Utilize compact storage to effectively dodge all uneccasary calculations and utilize symmetries were they are effective. For further proposed optimizations please see MA thesis "Coupled Cluster Studies in Computational Chemistry" from the Computational Physics Group at the University of Oslo. 
+
+- Makes use of armadillo and MPI. No other external libraries required.
+
+
+
+User guide:
+
+1) Ensure armadillo is linked properly. Edit .h files if needed.
+
+2) Ensure armadillo is installed properly to make use of external math library, like Intel MKL. 
+
+3) Input given in input file, which must be named INCAR. Please see uploaded example. 
+
+
