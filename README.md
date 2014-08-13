@@ -16,6 +16,12 @@ and CCSDT-n Models:
 
 Implemented with Cartesian Gaussian Type Orbitals, Cartesian GTOs.
 
+
+
+Please see file "INCAR". This is input file for program.
+
+
+
 Description of classes in alphabetical order:
 
 - cc_general.cpp:
@@ -23,6 +29,15 @@ Unfinished CCSDTQ Method.
 
 - ccsd_even.cpp:
 Old version of CCSD program using Compact Storage of arrays.
+
+- ccsd_memory_optimized.cpp
+Parallel working memory distributed highly optimized superhighspeed CCSD program. 
+
+- ccsd_non_iterative_part.cpp
+Class used to optimize ccsD_memory_optimized further. Maps out MPI.
+
+- ccsdt.cpp
+Calculates CCSDT energies.
 
 - coupled_cluster.cpp:
 First implementation of CCSD.
