@@ -74,10 +74,14 @@ Additional Comments:
 
 User guide:
 
-1) Ensure armadillo is linked properly. Edit .h files if needed.
+1) Install armadillo and MPI.
 
-2) Ensure armadillo is installed properly to make use of external math library, like Intel MKL. 
+2) Ensure armadillo and MPI is linked properly. Edit .h files if needed. 
 
-3) Input given in input file, which must be named INCAR. Please see uploaded example. 
+3) Ensure armadillo is installed properly to make use of external math library, like Intel MKL or BLAS, if you want high performance.
+
+4) Input given in input file, which must be named INCAR. Please see uploaded example. 
+
+5) If the combination of atoms you want are not currently available, try a different basis set or update fill_alpha and matrix_size_setter classes with new numbers from EMSL Basis Set Exchange (Freely available on the internet, google it).
 
 
